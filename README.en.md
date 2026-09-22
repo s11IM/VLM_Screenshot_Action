@@ -9,10 +9,6 @@
 
 A lightweight vision-language model (VLM) screenshot action tool: select a screen region, the AI understands the frame, drives mouse and keyboard with normalized coordinates, and loops until the task is done. No API or accessibility interface is required from the target application.
 
-## About This Project
-
-A complete implementation shared publicly, but not one under continuous heavy iteration. It doubles as a design archive: it records the core logic chain and architectural tradeoffs of this visual control loop (observe → decide → act → calibrate → loop) for future review, reuse, or porting into other projects. The documentation therefore focuses on "why it was designed this way and what it costs", with feature reference as a secondary thread.
-
 ## Design Decisions and Tradeoffs
 
 Presented in decision-chain order. Each entry explains why it was chosen and what it costs.
@@ -57,6 +53,53 @@ About 5,100 lines of source today (TypeScript ≈ 2,900 + Rust ≈ 2,200), no El
 ### Tool protocol
 
 Seven OpenAI function-calling tools (click / drag / hover / keyboard_type / keyboard_press / wait / end_round); unexpected Anthropic-style `computer` tool calls are safely mapped automatically (pixel coordinates converted to 0–1000; unmappable actions are rejected).
+
+---
+
+## Architecture
+
+### Core Flow
+
+```mermaid
+flowchart TD
+    A([You select a screen region and describe the task]) --> B[The app screenshots that region and sends it to the AI with the task]
+    B --> C{The AI looks at the image and thinks: what is next?}
+    C -- an action is needed --> D[Act: click, drag, hover, type, or wait]
+    D --> E[Wait for the screen to settle, then take a fresh screenshot<br/>with a red mark showing where it just acted]
+    E --> C
+    C -- task done or needs your decision --> F([The AI replies with a text summary; this round ends])
+    F --> G{Screenshot-after-reply enabled?}
+    G -- yes: idle mode --> H[After a delay, auto-screenshot starts the next round]
+    H --> C
+    G -- no --> I([Stop and wait for your next instruction])
+    J[Hold F8 at any time: stop everything immediately] -.-> C
+```
+
+The whole app simply makes the AI repeat a "look → act → look again to verify" loop until the task is done or you stop it. Each step sends only the latest screenshot (older ones become a one-line placeholder) to control cost; the internals are explained in the design decisions above.
+
+### Module Map
+
+```
+┌────────────────────────── Frontend (React + TS) ──────────────────────────┐
+│  App.tsx                  session/loop state machine, capture-act loop,   │
+│                            retry and cancellation                          │
+│  model.ts                 tool schemas, rolling-context assembly,          │
+│                            single-frame expiry, argument validation       │
+│  computerToolAdapter.ts   Anthropic computer tool calls → project tools   │
+│  storage.ts               IndexedDB session persistence (15-day GC)       │
+└──────────────────────────┬─────────────────────────────────────────────────┘
+                        Tauri invoke
+┌──────────────────────────▼─────────────────────────────────────────────────┐
+│  src-tauri/lib.rs          capture (auto-hides main window), API relay     │
+│                            (cancellable/timeout), keyboard safety lock,   │
+│                            region selection, mini mode, redacted logging  │
+│  desktop-core/             input primitives: SendInput absolute coords     │
+│                            (virtual desktop), key parsing, interruptible  │
+│                            hold/typing, DPI awareness                     │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+See [docs/architecture.md](docs/architecture.md) for module responsibilities and a reading order.
 
 ---
 
@@ -115,64 +158,6 @@ npm run tauri build   # installers land in src-tauri/target/release/bundle/
 | Retry on failure | on, 3 s apart | 0–15 s, at most one retry |
 | Enable tools | on | off = conversation only |
 | Auto screenshot after tool | on | off = manual screenshots drive the next round |
-
----
-
-## Architecture
-
-### Runtime Flow
-
-```mermaid
-flowchart TD
-    START([User task + first screenshot + selected region]) --> CTX[Assemble context<br/>rolling window keeps the last N cycles<br/>scrolled-out parts kept as ACTIVE_TASK / LAST_ROUND_SUMMARY text anchors]
-    CTX --> EXPIRE[Single-frame expiry<br/>only the latest screenshot is tagged CURRENT_FRAME<br/>older ones replaced by OMITTED placeholders]
-    EXPIRE --> REQ[Request the model<br/>relayed by Rust, cancellable, timeout, one retry]
-    REQ --> ADAPT{Unexpected computer<br/>tool call returned?}
-    ADAPT -- yes --> MAP[Safely map to project tools<br/>unmappable actions are rejected]
-    ADAPT -- no --> HAS{Tool call returned?}
-    MAP --> HAS
-    HAS -- no, plain-text reply --> FINAL[Formal reply<br/>round ends]
-    HAS -- yes, execute first only --> VALID[Argument validation<br/>analysis trail + 0–1000 normalized coordinates]
-    VALID --> KIND{Tool kind}
-    KIND -- end_round --> ENDR([Emit run summary<br/>round ends])
-    KIND -- wait --> WAIT[Wait the given seconds]
-    KIND -- mouse / keyboard --> ACT[Execute input<br/>keyboard safety lock: frameId + region + foreground window]
-    WAIT --> AUTO{Auto screenshot after tool on?}
-    ACT --> AUTO
-    AUTO -- no --> USER([Wait for the user])
-    AUTO -- yes --> STAB[Delay for a stable frame]
-    STAB --> CAP[Re-capture<br/>overlay the previous landing marker]
-    CAP --> CTX
-    FINAL --> LOOP{Screenshot after reply on?}
-    LOOP -- yes --> TIMER[Delayed auto screenshot<br/>starts the next round]
-    TIMER --> CTX
-    LOOP -- no --> USER
-    STOP[F8 panic stop or UI stop] -.cascades to requests, input, timers.-> CTX
-```
-
-### Module Map
-
-```
-┌────────────────────────── Frontend (React + TS) ──────────────────────────┐
-│  App.tsx                  session/loop state machine, capture-act loop,   │
-│                            retry and cancellation                          │
-│  model.ts                 tool schemas, rolling-context assembly,          │
-│                            single-frame expiry, argument validation       │
-│  computerToolAdapter.ts   Anthropic computer tool calls → project tools   │
-│  storage.ts               IndexedDB session persistence (15-day GC)       │
-└──────────────────────────┬─────────────────────────────────────────────────┘
-                        Tauri invoke
-┌──────────────────────────▼─────────────────────────────────────────────────┐
-│  src-tauri/lib.rs          capture (auto-hides main window), API relay     │
-│                            (cancellable/timeout), keyboard safety lock,   │
-│                            region selection, mini mode, redacted logging  │
-│  desktop-core/             input primitives: SendInput absolute coords     │
-│                            (virtual desktop), key parsing, interruptible  │
-│                            hold/typing, DPI awareness                     │
-└───────────────────────────────────────────────────────────────────────────┘
-```
-
-See [docs/architecture.md](docs/architecture.md) for module responsibilities and a reading order.
 
 ---
 
