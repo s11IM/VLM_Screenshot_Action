@@ -5,6 +5,7 @@ desktop-core/target/
 /cache/*
 !/cache/README.md
 release/
+.playwright-mcp/
 *.log
 *.log.*
 .DS_Store

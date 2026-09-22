@@ -30,8 +30,10 @@ powershell -NoProfile -ExecutionPolicy Bypass -File scripts/build-release.ps1
 
 To run the desktop UI during development, use `npm run tauri -- dev`.
 `npm run dev` alone is only a browser UI preview, not a desktop-input runtime.
-`start.cmd` builds when necessary and launches the release application.
-`clean.cmd` removes generated dependencies/builds, not personal WebView data.
+`clickstart.cmd` builds when necessary and launches the release application.
+The executable is located at `src-tauri/target/release/vlm_screenshot_action.exe`;
+`clickstart.cmd` prints its absolute path before launching.
+`cleancache.cmd` removes generated dependencies/builds, not personal WebView data.
 
 API credentials are not needed for tests or builds. Configure your own endpoint
 and key in the application only for supervised manual testing. Never use real
