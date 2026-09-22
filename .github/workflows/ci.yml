@@ -1,0 +1,58 @@
+name: Windows Validation
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-validation-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    runs-on: windows-2022
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Set up Node
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version-file: .node-version
+          cache: npm
+      - name: Install pinned Rust toolchain
+        run: rustup show
+      - name: Scan source for secrets
+        run: |
+          $archive = Join-Path $env:RUNNER_TEMP "gitleaks.zip"
+          $tools = Join-Path $env:RUNNER_TEMP "gitleaks"
+          Invoke-WebRequest "https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_windows_x64.zip" -OutFile $archive
+          $expected = "d29144deff3a68aa93ced33dddf84b7fdc26070add4aa0f4513094c8332afc4e"
+          if ((Get-FileHash $archive -Algorithm SHA256).Hash.ToLowerInvariant() -ne $expected) {
+            throw "Gitleaks download checksum mismatch"
+          }
+          Expand-Archive $archive -DestinationPath $tools
+          & (Join-Path $tools "gitleaks.exe") dir . --config .gitleaks.toml --redact --no-banner
+      - name: Install locked frontend dependencies
+        run: npm ci
+      - name: Typecheck and test model contracts
+        run: npm run check
+      - name: Check npm advisories
+        run: npm audit --audit-level=high
+      - name: Check Rust formatting
+        run: npm run fmt:rust:check
+      - name: Build frontend
+        run: npm run build
+      - name: Test native contracts without desktop input
+        run: npm run test:rust
+      - name: Build release executable without launching or publishing
+        run: ./scripts/build-release.ps1

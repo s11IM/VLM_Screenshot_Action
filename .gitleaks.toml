@@ -1,0 +1,11 @@
+title = "VLM_Screenshot_Action source scan"
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Generated dependencies and build outputs; scan release artifacts separately"
+paths = [
+  '''(^|[\\/])(node_modules|target|dist|cache|\.git)[\\/]''',
+  '''(^|[\\/])src-tauri[\\/]gen[\\/]schemas[\\/]''',
+]

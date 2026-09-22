@@ -1,0 +1,28 @@
+[package]
+name = "vlm_screenshot_action"
+version = "0.1.1"
+description = "A screenshot-driven visual action tool for Windows"
+license = "MIT"
+publish = false
+edition = "2021"
+repository = "https://github.com/s11IM/VLM_Screenshot_Action"
+
+[lib]
+name = "vlm_screenshot_action_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.5.3", features = [] }
+
+[dependencies]
+base64 = "0.22"
+desktop-automation-core = { path = "../desktop-core" }
+enigo = "0.6.1"
+reqwest = { version = "0.13.4", features = ["json", "rustls", "http2"], default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tauri = { version = "2.11.5", features = [] }
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["macros", "sync", "time"] }
+uuid = { version = "1", features = ["v4"] }
+xcap = "0.9.7"

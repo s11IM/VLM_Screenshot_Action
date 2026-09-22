@@ -1,0 +1,26 @@
+name: Bug report
+description: Report a reproducible behavior or build problem, without private data.
+body:
+  - type: markdown
+    attributes:
+      value: Do not include API keys, raw logs, profiles, or private screenshots. Report vulnerabilities through the Security policy instead.
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Commit/version, Windows version, Node/Rust versions, monitor scaling, and model/provider if relevant. Never include the API key.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction
+      description: Include sanitized steps and whether this affects capture, context, API, input, or UI.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
