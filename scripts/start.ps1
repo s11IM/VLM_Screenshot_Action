@@ -33,4 +33,5 @@ if ($needsBuild) {
     & (Join-Path $PSScriptRoot "build-release.ps1")
 }
 
+Write-Output "[startup] Release executable: $appPath"
 & (Join-Path $PSScriptRoot "launch-app.ps1") -AppPath $appPath -WaitForExit:$WaitForExit

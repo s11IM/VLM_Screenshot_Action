@@ -15,7 +15,7 @@ if not errorlevel 1 (
     echo Clean completed successfully
     echo ====================================
     echo.
-    echo Run start.cmd to rebuild everything
+    echo Run clickstart.cmd to rebuild everything
     pause
     exit /b 0
 )
