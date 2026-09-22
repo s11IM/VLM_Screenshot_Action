@@ -172,8 +172,3 @@ npm run package:public # 打包便携版归档
 
 [MIT](LICENSE)
 
-## 致谢
-
-- [Anthropic Computer Use](https://github.com/anthropics/anthropic-quickstarts) —— VLM 桌面操作范式
-- [Self-Operating Computer](https://github.com/OthersideAI/self-operating-computer) —— 多模态模型操作计算机的早期实践
-- [Tauri](https://tauri.app) / [enigo](https://github.com/enigo-rs/enigo) / [xcap](https://github.com/nashaofu/xcap)
