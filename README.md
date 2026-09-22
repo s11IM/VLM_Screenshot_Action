@@ -3,32 +3,57 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Platform: Windows](https://img.shields.io/badge/Platform-Windows-0078D6.svg)](https://www.microsoft.com/windows)
 [![Tauri](https://img.shields.io/badge/Tauri-2.x-FFC131.svg)](https://tauri.app)
+[![Windows Validation](https://github.com/s11IM/VLM_Screenshot_Action/actions/workflows/ci.yml/badge.svg)](https://github.com/s11IM/VLM_Screenshot_Action/actions/workflows/ci.yml)
 
-一个轻量级的视觉语言模型（VLM）截图操作工具：你框选一块屏幕区域，AI 通过截图理解画面，用归一化坐标驱动键鼠，循环执行直到任务完成。无需目标软件提供任何 API 或无障碍接口。
+**中文** | [English](README.en.md)
 
-## 核心设计
+一个轻量级的视觉语言模型（VLM）截图操作工具：框选屏幕区域，AI 通过截图理解画面，用归一化坐标驱动键鼠，循环执行直到任务完成。无需目标软件提供任何 API 或无障碍接口。
 
-### 跨软件通用性
-- **纯视觉 + 坐标**：不依赖 UIA / DOM / 无障碍 API，只要画面可见即可操作——游戏、模拟器、老软件一视同仁
-- **归一化坐标空间**：模型统一在 0–1000 的相对平面上定位（左上 `0,0`，右下 `1000,1000`），与分辨率、窗口大小解耦
-- **标准工具协议**：7 个 OpenAI function-calling 工具（click / drag / hover / keyboard_type / keyboard_press / wait / end_round），并自动适配模型意外返回的 Anthropic `computer` 工具调用
 
-### 滚动式上下文，控制成本
-- **循环滚动窗口**：仅保留最近 N 个"观察-操作"循环（`contextCycles`，1–999 可调），更早的循环自动滚出上下文
-- **单帧发送**：每次请求只携带最新一张截图，历史截图替换为 `[IMAGE frame=OMITTED]` 占位符，token 消耗不随轮数累积
-- **锚点摘要**：滚出窗口的活跃任务（`ACTIVE_TASK`）与上一轮总结（`LAST_ROUND_SUMMARY`）以纯文本保留，长任务不迷失目标
-- **每步自校准**：截图上叠加红色十字/拖拽轨迹标记上一次落点，模型可据此修正偏差
+## 设计决策与取舍
 
-### 配置自由度
-- **任意 OpenAI 兼容接口**：API URL / Key / 模型名完全自定义，`reasoning_effort`（low / high / xhigh）透传
-- **节奏可调**：操作后截图延迟（0.5–20s）、回复后自动截图延迟（5–120s）、超时（5–300s）、重试开关与间隔均可配置
-- **运行模式**：工具调用可整体开关；工具后自动截图可关（纯对话验证）；系统提示词自由编辑
-- **回复后截图循环**：开启后每次正式回复自动延时截图、开启下一轮，实现持续挂机；迷你模式缩为置顶小窗不打扰游戏
+按决策链顺序展开，每条说明「为什么这样选、付出什么代价」。
 
-### 精简代码体量
-- **约 5,100 行源码**：TypeScript ≈ 2,900 行 + Rust ≈ 2,200 行，核心逻辑一览无余
-- **Tauri 单体架构**：无 Electron / Node.js 运行时捆绑，产物为标准 NSIS / MSI 安装包
-- **依赖克制**：前端仅 React + lucide 图标，Rust 侧 enigo + xcap + reqwest，无框架级抽象层
+### 1. 纯视觉 + 归一化坐标，而不是 UIA / DOM / 无障碍 API
+
+- **得到**：跨软件通用——游戏、模拟器、老软件一视同仁，不依赖目标程序暴露任何接口
+- **代价**：定位精度受模型视觉能力限制（小按钮、低对比度 UI 会难），无法操作更高权限（UAC）程序
+- **归一化坐标空间**：模型统一在 0–1000 的相对平面上定位（左上 `0,0`，右下 `1000,1000`），与分辨率、窗口大小、DPI 解耦
+
+### 2. 滚动上下文 + 单帧发送，而不是累积全部截图
+
+- **问题**：截图 token 成本高，逐轮累积很快撑爆上下文窗口和预算
+- **做法**：仅保留最近 N 个「观察-操作」循环（`contextCycles`，1–999 可调）；每次请求只携带最新一张截图，历史截图替换为 `[IMAGE frame=OMITTED]` 占位符——token 消耗不随轮数累积
+- **补偿**：滚出窗口的信息不直接丢弃——活跃任务（`ACTIVE_TASK`）与上一轮总结（`LAST_ROUND_SUMMARY`）以文本锚点保留，长任务不迷失目标
+- **代价**：模型失去远期视觉记忆，只能靠文本锚点回溯；需要「回看很久之前画面」的任务不适用
+
+### 3. 每步强制 analysis，而不是只回工具调用
+
+每次工具调用都要求附带 ≤1000 字符的 `analysis`（本步依据）。它同时服务两个目的：决策留痕（可审计、可调试），以及滚动上下文滚出窗口后的摘要素材——第 2 条的文本锚点正是从这里提炼。
+
+### 4. 每步自校准，闭合反馈环
+
+截图上叠加红色十字 / 拖拽轨迹标记上一次落点。模型从「预期落点 vs 实际画面变化」的偏差中自我修正，补偿纯视觉定位的漂移——这是第 1 条取舍的缓解措施。
+
+### 5. 安全边界作为一等设计
+
+| 机制 | 作用 |
+|------|------|
+| F8 全局急停 | 键盘输入期间任何时刻按住 F8 立即中断，中断后锁存不自动恢复 |
+| 键盘安全锁 | frameId、截图区域、前台窗口三者与最近一次截图完全一致才允许键盘操作；截图超 5 分钟或前台窗口变化即安全中断 |
+| 窗口自动避让 | 截图与操作前主窗口自动隐藏，不遮挡画面、不抢焦点 |
+| 脱敏日志 | JSONL 日志对 API Key、截图 base64、对话内容统一 `[redacted]`，2MB 自动轮转 ×4 |
+| 取消传播 | 中断级联取消 API 请求、键鼠动作与挂机定时器，组合键按逆序释放 |
+
+详见 [SECURITY.md](SECURITY.md)。
+
+### 6. Tauri 单体 + 依赖克制
+
+当前约 5,100 行源码（TypeScript ≈ 2,900 + Rust ≈ 2,200），无 Electron / Node.js 运行时捆绑，产物为标准 NSIS / MSI 安装包。前端仅 React + lucide 图标，Rust 侧 enigo + xcap + reqwest，无框架级抽象层——核心逻辑一览无余，方便阅读与移植。
+
+### 工具协议
+
+7 个 OpenAI function-calling 工具（click / drag / hover / keyboard_type / keyboard_press / wait / end_round）；对模型意外返回的 Anthropic `computer` 工具调用自动安全映射（坐标从像素换算为 0–1000，不可安全映射的动作直接拒绝）。
 
 ---
 
@@ -45,7 +70,7 @@
 ```bash
 git clone https://github.com/s11IM/VLM_Screenshot_Action.git
 cd VLM_Screenshot_Action
-npm install
+npm ci
 npm run tauri dev     # 开发调试
 npm run tauri build   # 产出安装包于 src-tauri/target/release/bundle/
 ```
@@ -56,17 +81,6 @@ npm run tauri build   # 产出安装包于 src-tauri/target/release/bundle/
 2. **框选区域**：点击「选择截图范围」，在屏幕遮罩上拖动框选目标窗口，Esc 取消
 3. **下达任务**：输入框描述目标（如「点击开始按钮并进入设置」）后发送
 4. **观察循环**：AI 自动执行 截图 → 分析 → 操作 → 再截图 的闭环，可随时中断；需要挂机时开启「回复后截图」并切到迷你模式
-
----
-
-## 典型场景
-
-| 场景 | 做法 |
-|------|------|
-| 游戏代操 | 框选游戏窗口 + 描述打法，AI 逐步点击并依据反馈调整 |
-| 模拟器挂机 | 开启「回复后截图」，AI 循环刷副本直到调用 `end_round` |
-| 无 API 的老旧软件 | 直接视觉定位菜单与按钮，替代编写自动化脚本 |
-| 桌面助手实验 | 关闭「工具后自动截图」，改为人工截图驱动的问答模式 |
 
 ---
 
@@ -81,8 +95,6 @@ npm run tauri build   # 产出安装包于 src-tauri/target/release/bundle/
 | `keyboard_press` | 物理按键 / 组合键 | `keys[]`（1–8 个），`holdMs` |
 | `wait` | 等待画面变化 | `seconds`（1–60） |
 | `end_round` | 结束本轮运行 | `message`（给用户的总结） |
-
-每次工具调用都要求附带 ≤1000 字符的 `analysis`（本步依据），既是决策留痕，也是滚动上下文里的摘要素材。
 
 ---
 
@@ -105,15 +117,47 @@ npm run tauri build   # 产出安装包于 src-tauri/target/release/bundle/
 
 ## 架构
 
+### 运行流程
+
+```mermaid
+flowchart TD
+    START([用户下达任务、附首帧截图、框选区域]) --> CTX[组装上下文<br/>滚动窗口保留最近 N 个循环<br/>滚出部分以 ACTIVE_TASK 与 LAST_ROUND_SUMMARY 文本锚点保留]
+    CTX --> EXPIRE[单帧过期<br/>仅最新截图标记 CURRENT_FRAME<br/>历史帧替换为 OMITTED 占位符]
+    EXPIRE --> REQ[请求模型<br/>Rust 转发、可取消、超时、失败重试一次]
+    REQ --> ADAPT{返回意外的<br/>computer 工具调用？}
+    ADAPT -- 是 --> MAP[安全映射为本项目工具<br/>不可安全映射的动作被拒绝]
+    ADAPT -- 否 --> HAS{返回工具调用？}
+    MAP --> HAS
+    HAS -- 否、纯文本回复 --> FINAL[正式回复<br/>本轮结束]
+    HAS -- 是、仅执行第一个 --> VALID[参数校验<br/>analysis 留痕与 0–1000 归一化坐标]
+    VALID --> KIND{工具类型}
+    KIND -- end_round --> ENDR([输出运行总结<br/>本轮结束])
+    KIND -- wait --> WAIT[等待指定秒数]
+    KIND -- 键鼠操作 --> ACT[执行键鼠<br/>键盘安全锁：frameId、区域、前台窗口三重一致]
+    WAIT --> AUTO{工具后自动截图开启？}
+    ACT --> AUTO
+    AUTO -- 否 --> USER([等待用户])
+    AUTO -- 是 --> STAB[延时等待画面稳定]
+    STAB --> CAP[重新截图<br/>叠加上一次落点标记]
+    CAP --> CTX
+    FINAL --> LOOP{回复后截图开启？}
+    LOOP -- 是 --> TIMER[延时后自动截图<br/>自动开启下一轮]
+    TIMER --> CTX
+    LOOP -- 否 --> USER
+    STOP[F8 急停或界面停止] -.级联取消请求、键鼠与定时器.-> CTX
+```
+
+### 模块划分
+
 ```
 ┌──────────────────────────── 前端 (React + TS) ────────────────────────────┐
 │  App.tsx                  会话/循环状态机、截图-执行闭环、重试与取消        │
 │  model.ts                 工具 schema、滚动上下文组装、单帧过期、参数校验   │
 │  computerToolAdapter.ts   Anthropic computer 工具调用 → 本项目工具映射     │
 │  storage.ts               IndexedDB 会话持久化（15 天不活跃自动清理）      │
-└──────────────────────────────────┬────────────────────────────────────────┘
+└──────────────────────────┬─────────────────────────────────────────────────┘
                         Tauri invoke
-┌──────────────────────────────────▼────────────────────────────────────────┐
+┌──────────────────────────▼─────────────────────────────────────────────────┐
 │  src-tauri/lib.rs          截图（自动隐藏主窗）、API 转发（可取消/超时）、  │
 │                            键盘安全锁、区域选择、迷你模式、脱敏日志        │
 │  desktop-core/             输入原语：SendInput 绝对坐标（虚拟桌面）、      │
@@ -121,17 +165,7 @@ npm run tauri build   # 产出安装包于 src-tauri/target/release/bundle/
 └───────────────────────────────────────────────────────────────────────────┘
 ```
 
-**截图与操作闭环**：发送任务 → 截图（标注为 `CURRENT_FRAME`）→ 模型返回 `analysis` + 工具调用 → 执行键鼠 → 延时后重新截图（叠加落点标记）→ 进入下一循环，直到模型调用 `end_round` 或被中断。
-
----
-
-## 安全设计
-
-- **F8 全局急停**：键盘输入期间任何时刻按住 F8 立即中断（检测按键按住状态，窗口隐藏也生效），且中断后锁存、不会自动恢复
-- **键盘安全锁**：键盘操作要求 frameId、截图区域、前台窗口三者与最近一次截图完全一致，截图超过 5 分钟或前台窗口变化即安全中断——防止把文字打进错误的窗口
-- **窗口自动避让**：截图与操作前主窗口自动隐藏，避免遮挡画面或抢焦点
-- **脱敏日志**：JSONL 日志（`vlm_screenshot_action.log`，2MB 自动轮转 ×4 归档）对 API Key、截图 base64、对话内容等字段统一 `[redacted]`
-- **取消传播**：中断会级联取消进行中的 API 请求、键鼠动作与挂机定时器；组合键按逆序释放
+更详细的模块职责与阅读顺序见 [docs/architecture.md](docs/architecture.md)。
 
 ---
 
@@ -171,4 +205,3 @@ npm run package:public # 打包便携版归档
 ## 许可证
 
 [MIT](LICENSE)
-
