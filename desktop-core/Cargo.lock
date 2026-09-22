@@ -397,7 +397,7 @@ version = "0.1.0"
 dependencies = [
  "enigo",
  "serde",
- "windows 0.61.3",
+ "windows 0.62.2",
  "xcap",
 ]
 
