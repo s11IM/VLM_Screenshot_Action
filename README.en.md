@@ -11,8 +11,6 @@ A lightweight vision-language model (VLM) screenshot action tool: select a scree
 
 ## Design Decisions and Tradeoffs
 
-Presented in decision-chain order. Each entry explains why it was chosen and what it costs.
-
 ### 1. Pure vision + normalized coordinates, not UIA / DOM / accessibility APIs
 
 - **Gain**: works across any software — games, emulators, and legacy apps alike; no interface required from the target program
@@ -189,10 +187,6 @@ npm run package:public # build the portable archive
 ```
 
 Runtime logs live in `vlm_screenshot_action.log` under the system application-log directory.
-
-## Roadmap
-
-- [ ] OCR text extraction to aid targeting
 
 ## License
 
