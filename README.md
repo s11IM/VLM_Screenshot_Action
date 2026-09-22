@@ -166,9 +166,6 @@ npm run package:public # 打包便携版归档
 
 ## 路线图
 
-- [ ] macOS / Linux 支持（替换 desktop-core 平台层）
-- [ ] 可点击元素标注（Set-of-Mark）提升定位精度
-- [ ] 常用区域保存与快速切换
 - [ ] OCR 文本提取辅助定位
 
 ## 许可证
