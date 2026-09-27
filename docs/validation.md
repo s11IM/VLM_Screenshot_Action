@@ -68,9 +68,13 @@ payment page, privileged application, or account with valuable state.
 - [ ] Keyboard input requires a fresh matching frame; switching focus interrupts it.
 - [ ] Holding F8 during a long key hold stops it and releases pressed keys.
 - [ ] UI cancellation works during a pending request and a settling delay.
-- [ ] Reply capture starts a new round only when enabled; stopping it cancels the timer.
+- [ ] Full auto capture starts a new round only when enabled; stopping it cancels the timer.
 - [ ] A tool failure is distinguishable from verified success in subsequent context.
-- [ ] Restart restores history/settings but does not resume an operation.
+- [ ] Three consecutive steps that cannot execute end the round instead of looping.
+- [ ] Restart restores history with its screenshots intact, from both a legacy
+      inline store and the split image store.
+- [ ] A failed history write surfaces a warning instead of failing silently.
+- [ ] Restart restores settings but does not resume an operation.
 
 Record the model/provider, monitor layout, Windows version, and tested commit.
 Never describe a check as passed merely because corresponding code exists.

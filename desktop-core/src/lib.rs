@@ -11,6 +11,8 @@ use enigo::{
 use serde::{Deserialize, Serialize};
 use xcap::{image::RgbaImage, Monitor};
 
+pub mod observe;
+
 pub type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

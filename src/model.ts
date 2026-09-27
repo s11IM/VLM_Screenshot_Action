@@ -7,13 +7,13 @@ import type {
   ToolCall,
 } from "./types";
 
-export const SYSTEM_PROMPT = `你通过截图操作游戏，只能在用户框选的区域内点击、拖拽、悬停，或向当前前台窗口输入键盘，或用 wait 等待、end_round 结束本次运行。
+export const SYSTEM_PROMPT = `你通过截图操作游戏，只能在用户框选的区域内操作。
 
-坐标只来自标记为 CURRENT_FRAME 的最新画面：把它当作 1000x1000 的相对平面（左上 0,0，中心 500,500，右下 1000,1000），按目标所在的相对位置直接输出坐标。画面中的红色十字标记是你上一次操作的落点，可据此判断偏差。不要用更早的画面或用户上传的参考图定位。
+坐标只来自标记为 CURRENT_FRAME 的最新画面，不要用更早的画面或用户上传的参考图定位。画面中的红色十字标记是你上一次操作的落点，可据此判断偏差；每次操作后都要依据新截图确认效果。
 
-键盘操作目标必须与 CURRENT_FRAME 截图时的前台窗口一致，窗口变化会安全中断本轮。keyboard_type 用于输入字面 Unicode 文本（可包含中文、换行和 Tab），keyboard_press 用于单键、组合键和短时间保持的游戏按键。输入框或游戏窗口需要先用 click 获取焦点；每次操作后都要依据新截图确认效果。F8 保留为用户键盘输入急停键，不可调用。
+键盘操作目标必须与 CURRENT_FRAME 截图时的前台窗口一致，窗口变化会安全中断本轮。
 
-还有操作就调用一个工具；不调用工具的回复会被当作本次运行结束。`;
+还有操作就调用一个工具；没有可用工具时直接回复文字；不调用工具的回复会被当作本次运行结束。`;
 
 const STRATEGY_ANALYSIS_PROPERTY = {
   type: "string",
@@ -51,7 +51,8 @@ export const ACTION_TOOLS = [
           },
           clicks: {
             type: "integer",
-            enum: [1, 2],
+            minimum: 1,
+            maximum: 2,
             description: "1 为单击，2 为双击。",
           },
         },
@@ -199,7 +200,7 @@ export const ACTION_TOOLS = [
     type: "function",
     function: {
       name: "wait",
-      description: "不执行任何鼠标操作，等待指定秒数后重新截图并继续运行。用于对手回合、动画播放或画面加载。",
+      description: "不执行任何输入。系统持续检测画面：当画面出现明显变化并趋稳，或到达最晚复查时间时，自动返回新截图。用于对手回合、动画播放、加载等场景；无需指定时长，也不能指定时长。",
       parameters: {
         type: "object",
         properties: {
@@ -210,14 +211,8 @@ export const ACTION_TOOLS = [
             maxLength: 120,
             description: "等待原因的简短名称。",
           },
-          seconds: {
-            type: "integer",
-            minimum: 1,
-            maximum: 60,
-            description: "等待秒数。",
-          },
         },
-        required: ["analysis", "name", "seconds"],
+        required: ["analysis", "name"],
         additionalProperties: false,
       },
     },
@@ -323,10 +318,12 @@ export function buildMessages(
     && Boolean(message.text.trim())
     && index > (activeTask?.index ?? -1),
   );
+  // User instructions and the built-in contract share one system message as peers:
+  // no heading, no subordination, user text first.
   const messages: ChatCompletionMessage[] = [{
     role: "system",
     content: systemPrompt.trim()
-      ? `${SYSTEM_PROMPT}\n\n## 用户补充指令\n${systemPrompt.trim()}`
+      ? `${systemPrompt.trim()}\n\n${SYSTEM_PROMPT}`
       : SYSTEM_PROMPT,
   }];
 
@@ -575,7 +572,6 @@ export function parseToolArguments(call: ToolCall): Record<string, unknown> {
           maxLength: 1000,
         }),
         name: stringValue("name", { maxLength: 120 }),
-        seconds: numberValue("seconds", 1, 60, { round: true }),
       };
     case "end_round":
       return {

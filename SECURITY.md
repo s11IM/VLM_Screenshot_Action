@@ -20,8 +20,8 @@ why the target requires them. Follow the target application's terms of use.
 - Mouse coordinates are bounded by the selected rectangle, but that rectangle
   is not locked to an application. Keyboard actions target a validated
   foreground window and can still invoke powerful OS/application shortcuts.
-- F8 is checked during keyboard execution only. Use the UI stop control for
-  other phases. Cancellation cannot undo input already sent.
+- F8 is checked during keyboard execution and while waiting for the screen to
+  settle. Use the UI stop control for other phases, such as a network request. Cancellation cannot undo input already sent.
 - There is no total action/time/cost budget. Requests have a timeout and may
   retry once; the overall loop can continue until stopped or completed.
 - The WebView CSP is currently disabled. Do not add remote scripts, remote UI

@@ -1,5 +1,5 @@
 import { invoke } from "@tauri-apps/api/core";
-import type { CapturedImage, ChatCompletionResponse, Region } from "./types";
+import type { CapturedImage, ChatCompletionResponse, Region, RegionObservation } from "./types";
 
 export const isTauri = () => "__TAURI_INTERNALS__" in window;
 
@@ -24,6 +24,24 @@ export async function enterMiniMode(): Promise<void> {
 export async function exitMiniMode(): Promise<void> {
   if (!isTauri()) return;
   await invoke("exit_mini_mode");
+}
+
+export async function observeRegion(
+  region: Region,
+  context: {
+    operationId?: string;
+    roundId?: string;
+    captureKind?: string;
+    toolStep?: number;
+    deadlineMs: number;
+    probeEnabled: boolean;
+    markerX?: number;
+    markerY?: number;
+    markerFromX?: number;
+    markerFromY?: number;
+  },
+): Promise<RegionObservation> {
+  return invoke<RegionObservation>("observe_region", { region, ...context });
 }
 
 export async function captureRegion(

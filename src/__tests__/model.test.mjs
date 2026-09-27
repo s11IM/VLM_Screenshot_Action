@@ -48,8 +48,10 @@ test("context selection preserves a cropped task and latest eligible summary", (
   const before = structuredClone(conversation);
   const messages = buildMessages(conversation, { contextCycles: 1 }, "Avoid shortcuts");
 
-  assert.ok(messages[0].content.startsWith(SYSTEM_PROMPT));
-  assert.ok(messages[0].content.endsWith("Avoid shortcuts"));
+  assert.ok(messages[0].content.startsWith("Avoid shortcuts"));
+  assert.ok(messages[0].content.endsWith(SYSTEM_PROMPT));
+  assert.equal(messages[0].content.includes("用户补充指令"), false);
+  assert.equal(messages[0].content, `Avoid shortcuts\n\n${SYSTEM_PROMPT}`);
   assert.deepEqual(messages.slice(1, 3), [
     { role: "user", content: "[ACTIVE_TASK]\nReach the exit" },
     { role: "assistant", content: "[LAST_ROUND_SUMMARY]\nDoor unlocked" },
@@ -162,6 +164,43 @@ test("offers keyboard tools with mouse tools", () => {
     ACTION_TOOLS.map((tool) => tool.function.name),
     ["click", "drag", "hover", "keyboard_type", "keyboard_press", "wait", "end_round"],
   );
+});
+
+test("no tool schema carries a non-string enum", () => {
+  // Some OpenAI-compatible gateways translate tools to Gemini function
+  // declarations, which reject numeric enum members with HTTP 400. Express
+  // allowed values with minimum/maximum instead.
+  const seen = [];
+  const walk = (node, path) => {
+    if (!node || typeof node !== "object") return;
+    if (Array.isArray(node)) {
+      node.forEach((item, index) => walk(item, `${path}[${index}]`));
+      return;
+    }
+    if (Array.isArray(node.enum)) {
+      seen.push({ path, enum: node.enum });
+    }
+    for (const [key, value] of Object.entries(node)) {
+      walk(value, path ? `${path}.${key}` : key);
+    }
+  };
+  walk(ACTION_TOOLS, "");
+  const nonString = seen.filter(({ enum: values }) => values.some((value) => typeof value !== "string"));
+  assert.deepEqual(nonString, [], `non-string enum members found: ${JSON.stringify(nonString)}`);
+  assert.equal(JSON.stringify(ACTION_TOOLS).includes('"enum":[1,2]'), false);
+});
+
+test("wait takes no duration argument in schema or parsing", () => {
+  const waitTool = ACTION_TOOLS.find((tool) => tool.function.name === "wait");
+  assert.equal(Object.hasOwn(waitTool.function.parameters.properties, "seconds"), false);
+  assert.equal(waitTool.function.parameters.required.includes("seconds"), false);
+  assert.match(waitTool.function.description, /不能指定时长/);
+  assert.equal(SYSTEM_PROMPT.includes("wait"), false);
+
+  assert.deepEqual(parseToolArguments(call("wait", {
+    ...common,
+    seconds: 12,
+  })), common);
 });
 
 test("parses Unicode typing defaults and optional submit", () => {

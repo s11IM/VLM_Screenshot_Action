@@ -25,22 +25,26 @@ these engineering documents. Nothing in this checklist publishes automatically.
 ## Source Versus Binary Releases
 
 The Git repository contains source, documentation, tests, and build inputs.
-An installer or portable ZIP belongs in GitHub Releases, not source history.
+The NSIS installer belongs in GitHub Releases, not source history.
 CI intentionally does not create releases or attach executables.
 
-Build a public package from a clean checkout:
+Build the public installer from a clean checkout:
 
 ```powershell
 npm ci
 npm run check
 npm run test:rust
-npm run package:public
+npm run tauri build -- --bundles nsis
 ```
 
-`package:public` rejects settings/history inclusion and uses a separate
-`release/public` output directory. It packages the project license and checks
-that no `user-data` directory was included. This is a guardrail, not a substitute
-for inspecting the final ZIP or satisfying third-party binary license notices.
+The installer lands in `src-tauri/target/release/bundle/nsis/`. It is the only
+supported public artifact: a single per-user NSIS setup, no MSI, no portable
+archive. Inspect it before attaching it to a release, and satisfy third-party
+binary license notices; the build does not do that for you.
+
+A portable archive can still be assembled locally with
+`npm run package:public` for personal use, but it is not part of a public
+release.
 
 `package-migration.cmd` is for personal migration. Never upload a migration
 archive made with `-IncludeSettings` or `-IncludeHistory`; it can contain API

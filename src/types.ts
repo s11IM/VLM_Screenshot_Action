@@ -13,6 +13,7 @@ export type Settings = {
   contextCycles: number;
   replyCaptureDelay: number;
   operationCaptureDelay: number;
+  earlyProbeEnabled: boolean;
   requestTimeout: number;
   retryDelay: number;
   retryOnFailure: boolean;
@@ -33,6 +34,17 @@ export type Attachment = {
 export type CapturedImage = {
   dataUrl: string;
   frameId: string;
+};
+
+export type ObservationTrigger = { changedAtMs: number; settledAtMs: number } | null;
+
+export type RegionObservation = {
+  dataUrl: string;
+  frameId: string;
+  outcome: "early_wake" | "deadline";
+  waitedMs: number;
+  samples: number;
+  trigger: ObservationTrigger;
 };
 
 export type Message = {

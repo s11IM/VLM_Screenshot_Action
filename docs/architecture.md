@@ -58,15 +58,17 @@ sequenceDiagram
 3. `runModel` rebuilds context for each request. Tools are offered only when
    enabled and a non-upload frame exists in the current round.
 4. A response without tool calls is treated as a final reply. `end_round`
-   explicitly ends the current round.
+   explicitly ends the current round. Three consecutive steps that cannot
+   execute also end the round, since the loop has no other bound.
 5. At most the first returned tool call is executed, even if the provider
    ignores `parallel_tool_calls: false`.
-6. `wait` delays observation without native input. Mouse and keyboard tools
-   cross the IPC boundary. Ordinary failures become an action-result message
-   and, when a region exists, a refreshed observation.
-7. With tool-result capture enabled, successful input is followed by a delay,
-   a new screenshot, and another model request. With it disabled, a successful
-   action ends the run without another observation.
+6. `wait` requests no native input and takes no duration. Mouse and keyboard
+   tools cross the IPC boundary. Ordinary failures become an action-result
+   message and, when a region exists, a refreshed observation.
+7. With tool-result capture enabled, successful input is followed by a settling
+   wait, a new screenshot, and another model request. With it disabled, a
+   successful action ends the run without another observation, except that
+   `wait` still returns a screenshot.
 
 The implementation uses a non-streaming Chat Completions-compatible API.
 `reasoning_effort` is always sent; not every provider or model supports it.
@@ -88,7 +90,10 @@ and an ended round is not necessarily the end of automatic observation.
 
 ## Context Is a Projection, Not the History
 
-The IndexedDB history retains complete messages and image data. `buildMessages`
+The IndexedDB history retains complete messages. Screenshot payloads live in a
+separate object store keyed by attachment id, and the conversation record keeps
+only a reference-shaped attachment, so a save writes just the payloads that are
+new instead of rewriting every screenshot ever captured. `buildMessages`
 creates a smaller request view:
 
 - The fixed system contract is combined with user-supplied instructions.
@@ -155,12 +160,20 @@ be undone, and not every capture or delay is instantly interruptible.
 
 | Loop | Trigger | Identity |
 | --- | --- | --- |
-| Tool-result capture | After an action settles (normally seven seconds) | New cycle, same round |
-| Reply capture | After a formal reply, when explicitly enabled (normally fifteen seconds) | New round and operation |
+| Tool-result capture | After an action settles (normally eight seconds) | New cycle, same round |
+| Full auto capture | After a formal reply, when explicitly enabled (normally fifteen seconds) | New round and operation |
 
-Hover uses a shorter one-to-three-second delay. `wait` uses its requested
-one-to-sixty-second delay. Reply capture is completion-triggered, not a fixed
-interval screenshot service. `end_round` does not disable reply capture.
+One timer governs the post-action wait, and it is the same setting for every
+tool. While it runs, native sampling compares the region against the frame the
+model last saw; when the screen changes and then holds still, the wait ends
+early and the new screenshot is returned without spending the rest of the
+budget. A `wait` that follows such an early wake resumes only the unspent
+remainder and does not probe again, so a round cannot extend its own deadline
+by waiting. A fresh action resets the timer.
+
+Early probing is optional and can be switched off, which restores a plain
+timed wait. Full auto capture is completion-triggered, not a fixed interval
+screenshot service. `end_round` does not disable it.
 
 ## Boundaries and Non-Goals
 

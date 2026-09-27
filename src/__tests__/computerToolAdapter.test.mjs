@@ -49,9 +49,11 @@ test("adapts screenshot and wait without coordinates", () => {
   ], context);
 
   assert.equal(result.calls[0].function.name, "wait");
-  assert.equal(JSON.parse(result.calls[0].function.arguments).seconds, 1);
+  assert.equal(Object.hasOwn(JSON.parse(result.calls[0].function.arguments), "seconds"), false);
+  assert.equal(result.events[0].ignoredDuration, undefined);
   assert.equal(result.calls[1].function.name, "wait");
-  assert.equal(JSON.parse(result.calls[1].function.arguments).seconds, 1);
+  assert.equal(Object.hasOwn(JSON.parse(result.calls[1].function.arguments), "seconds"), false);
+  assert.equal(result.events[1].ignoredDuration, 0.25);
 });
 
 test("adapts double click, mouse move, and drag", () => {

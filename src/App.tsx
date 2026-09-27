@@ -1,4 +1,5 @@
 import {
+  AlertTriangle,
   Bot,
   Camera,
   ChevronRight,
@@ -23,6 +24,7 @@ import {
   X,
 } from "lucide-react";
 import {
+  memo,
   useEffect,
   useRef,
   useState,
@@ -37,12 +39,19 @@ import {
   parseToolArguments,
 } from "./model";
 import { adaptUnexpectedComputerToolCalls } from "./computerToolAdapter";
+import { observationWindow, pausedObservationRemainder } from "./observationTimer";
+import {
+  nextToolFailureStreak,
+  toolFailureLimitReached,
+  TOOL_FAILURE_LIMIT,
+} from "./toolFailureGuard";
 import { loadStoredConversations, storeConversations } from "./storage";
 import {
   beginOperation,
   cancelOperation,
   captureRegion,
   enterMiniMode,
+  observeRegion,
   executeInputAction,
   exitMiniMode,
   finishOperation,
@@ -68,7 +77,8 @@ const DEFAULT_SETTINGS: Settings = {
   reasoningEffort: "low",
   contextCycles: 3,
   replyCaptureDelay: 15,
-  operationCaptureDelay: 7,
+  operationCaptureDelay: 8,
+  earlyProbeEnabled: true,
   requestTimeout: 60,
   retryDelay: 3,
   retryOnFailure: true,
@@ -139,7 +149,7 @@ const normalizeSettings = (value: Partial<Settings>): Settings => ({
   ...value,
   contextCycles: clampNumber(value.contextCycles, 1, 999, DEFAULT_SETTINGS.contextCycles),
   replyCaptureDelay: clampNumber(value.replyCaptureDelay, 5, 120, DEFAULT_SETTINGS.replyCaptureDelay),
-  operationCaptureDelay: clampNumber(value.operationCaptureDelay, 0.5, 20, DEFAULT_SETTINGS.operationCaptureDelay),
+  operationCaptureDelay: clampNumber(value.operationCaptureDelay, 0.5, 120, DEFAULT_SETTINGS.operationCaptureDelay),
   requestTimeout: clampNumber(value.requestTimeout, 5, 300, DEFAULT_SETTINGS.requestTimeout),
   retryDelay: clampNumber(value.retryDelay, 0, 15, DEFAULT_SETTINGS.retryDelay),
   reasoningEffort: value.reasoningEffort === "xhigh"
@@ -148,6 +158,7 @@ const normalizeSettings = (value: Partial<Settings>): Settings => ({
       ? "high"
       : "low",
   toolsEnabled: value.toolsEnabled ?? DEFAULT_SETTINGS.toolsEnabled,
+  earlyProbeEnabled: value.earlyProbeEnabled ?? DEFAULT_SETTINGS.earlyProbeEnabled,
   autoCaptureAfterTool:
     value.autoCaptureAfterTool ?? DEFAULT_SETTINGS.autoCaptureAfterTool,
 });
@@ -212,15 +223,9 @@ const actionResultContextText = (
   return `[ACTION_RESULT tool=${safeTool} status=FAILED code=${safeCode} reason=${reason} fix=${fix}]`;
 };
 
-const sleepWithCancel = async (ms: number, isCancelled: () => boolean) => {
-  const step = 250;
-  let elapsed = 0;
-  while (elapsed < ms) {
-    await new Promise((resolve) => window.setTimeout(resolve, Math.min(step, ms - elapsed)));
-    elapsed += step;
-    if (isCancelled()) return false;
-  }
-  return !isCancelled();
+const formatDeadlineSeconds = (deadlineMs: number) => {
+  const seconds = deadlineMs / 1000;
+  return Number.isInteger(seconds) ? String(seconds) : seconds.toFixed(1);
 };
 
 function App() {
@@ -240,9 +245,11 @@ function App() {
   const [page, setPage] = useState<"chat" | "settings">("chat");
   const [historyOpen, setHistoryOpen] = useState(false);
   const [storageReady, setStorageReady] = useState(false);
+  const [storageError, setStorageError] = useState<string | null>(null);
   const [draft, setDraft] = useState("");
   const [pendingAttachments, setPendingAttachments] = useState<Attachment[]>([]);
   const [isBusy, setIsBusy] = useState(false);
+  const [isCapturing, setIsCapturing] = useState(false);
   const [isCancelling, setIsCancelling] = useState(false);
   const [replyCaptureEnabled, setReplyCaptureEnabled] = useState(false);
   const [miniMode, setMiniMode] = useState(false);
@@ -251,6 +258,8 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const busyRef = useRef(false);
+  const captureBusyRef = useRef(false);
+  const runningConversationRef = useRef<string | null>(null);
   const operationRef = useRef<string | null>(null);
   const roundRef = useRef<string | null>(null);
   const replyCaptureTimerRef = useRef<number | null>(null);
@@ -328,7 +337,7 @@ function App() {
   useEffect(() => {
     const prune = () => {
       setConversations((current) => {
-        const protectedConversationId = busyRef.current ? activeId : null;
+        const protectedConversationId = runningConversationRef.current;
         const cutoff = Date.now() - HISTORY_RETENTION_MS;
         const kept = current.filter((conversation) => {
           if (conversation.id === protectedConversationId) return true;
@@ -368,9 +377,16 @@ function App() {
   useEffect(() => {
     if (!storageReady) return;
     const timer = window.setTimeout(() => {
-      void storeConversations(conversations).catch((error) =>
-        logClientEvent("storage.indexeddb_write_failed", { error: String(error) }, "warn"),
-      );
+      void storeConversations(conversations)
+        .then(() => setStorageError(null))
+        .catch((error) => {
+          logClientEvent(
+            "storage.indexeddb_write_failed",
+            { error: String(error) },
+            "warn",
+          );
+          setStorageError(String(error));
+        });
     }, 180);
     return () => window.clearTimeout(timer);
   }, [conversations, storageReady]);
@@ -425,6 +441,7 @@ function App() {
   };
 
   const takeScreenshot = async (source: Attachment["source"] = "manual") => {
+    if (busyRef.current || captureBusyRef.current) return null;
     if (!region) {
       setNotice("请先选择截图区域");
       return null;
@@ -436,6 +453,8 @@ function App() {
 
     logClientEvent("capture.requested", { source, region });
     setNotice("正在截取目标区域...");
+    captureBusyRef.current = true;
+    setIsCapturing(true);
     try {
       const capture = await captureRegion(region, { captureKind: source });
       const attachment = createAttachment(capture.dataUrl, source, region, capture.frameId);
@@ -445,23 +464,32 @@ function App() {
     } catch (error) {
       setNotice(`截图失败：${String(error)}`);
       logClientEvent("capture.request_failed", { source, error: String(error) }, "error");
-      throw error;
+      return null;
+    } finally {
+      captureBusyRef.current = false;
+      setIsCapturing(false);
     }
   };
 
   const chooseRegion = async () => {
+    if (busyRef.current || captureBusyRef.current) return;
     if (!isTauri()) {
       setRegion({ x: 80, y: 80, width: 1280, height: 720 });
       setNotice("已设置浏览器演示区域；桌面端可实际框选屏幕");
       return;
     }
     setNotice("在遮罩上拖动鼠标框选目标区域，Esc 取消");
+    captureBusyRef.current = true;
+    setIsCapturing(true);
     try {
       const selected = await selectRegion();
       setRegion(selected);
       setNotice("目标区域已更新");
     } catch (error) {
       setNotice(String(error));
+    } finally {
+      captureBusyRef.current = false;
+      setIsCapturing(false);
     }
   };
 
@@ -536,20 +564,20 @@ function App() {
     roundId: string,
     toolStep: number,
     frameId?: string,
+    observeDeadlineMs?: number,
   ) => {
     const toolName = call.function.name;
     if (toolName === "wait") {
-      const seconds = typeof args.seconds === "number" ? args.seconds : 1;
+      const deadlineMs = observeDeadlineMs ?? Math.max(0.5, settings.operationCaptureDelay) * 1000;
       logClientEvent("tool.wait_prepared", {
         operationId,
         roundId,
         toolStep,
         toolCallId: call.id,
         name: typeof args.name === "string" ? args.name : null,
-        seconds,
       });
-      setNotice(`等待 ${seconds} 秒后继续观察...`);
-      return toolResultJson({ status: "waiting", seconds });
+      setNotice(`正在观察画面变化，最迟 ${formatDeadlineSeconds(deadlineMs)} 秒后返回新截图...`);
+      return toolResultJson({ status: "waiting" });
     }
     if (toolName === "end_round") {
       const message = typeof args.message === "string" ? args.message : "";
@@ -624,6 +652,9 @@ function App() {
     };
     let toolCallCount = 0;
     let requestIndex = 0;
+    let toolFailureStreak = 0;
+    let lastToolFailureCode: string | undefined;
+    let earlyWakePending: number | null = null;
     let lastActionMarker: {
       x: number;
       y: number;
@@ -742,8 +773,8 @@ function App() {
       let usedInput = false;
       let roundEnded = false;
       let roundEndMessage = "本次运行已结束。";
-      let postActionDelayMs: number | null = null;
-      let postActionNotice: string | null = null;
+      let observeDeadlineMs = Math.max(0.5, settings.operationCaptureDelay) * 1000;
+      let observeProbeEnabled = settings.earlyProbeEnabled;
       for (const call of toolCalls) {
         if (operationRef.current !== operationId) throw new Error("本轮请求已取消");
         let toolOutcome: "succeeded" | "blocked" | "failed" = "succeeded";
@@ -797,6 +828,9 @@ function App() {
                 ? args.message
                 : roundEndMessage;
             } else {
+              const observation = observationWindow(call.function.name, earlyWakePending, settings);
+              observeDeadlineMs = observation.deadlineMs;
+              observeProbeEnabled = observation.probeEnabled;
               await executeTool(
                 call,
                 args,
@@ -805,7 +839,10 @@ function App() {
                 roundId,
                 toolCallCount,
                 currentFrame?.frameId,
+                observeDeadlineMs,
               );
+              // Failed or blocked tools do not consume the paused timer.
+              earlyWakePending = null;
               usedInput = true;
               if (call.function.name === "click" || call.function.name === "hover") {
                 lastActionMarker = { x: args.x as number, y: args.y as number };
@@ -821,12 +858,6 @@ function App() {
                 || call.function.name === "keyboard_press"
               ) {
                 lastActionMarker = null;
-              }
-              if (call.function.name === "wait") {
-                postActionDelayMs = (typeof args.seconds === "number" ? args.seconds : 1) * 1000;
-              } else if (call.function.name === "hover") {
-                postActionDelayMs = Math.min(Math.max(1, settings.operationCaptureDelay), 3) * 1000;
-                postActionNotice = "等待悬浮提示与画面稳定...";
               }
             }
           } catch (error) {
@@ -878,6 +909,12 @@ function App() {
           contextText,
           createdAt: Date.now(),
         });
+        toolFailureStreak = nextToolFailureStreak(toolFailureStreak, toolOutcome);
+        if (toolOutcome === "succeeded") {
+          lastToolFailureCode = undefined;
+        } else {
+          lastToolFailureCode = failureCode;
+        }
       }
 
       if (roundEnded) {
@@ -899,38 +936,57 @@ function App() {
         setNotice("本轮完成");
         return true;
       }
+      if (toolFailureLimitReached(toolFailureStreak)) {
+        appendCycleMessage({
+          id: uid(),
+          role: "assistant",
+          roundId,
+          cycleId: currentCycleId,
+          kind: "final",
+          text: `连续 ${TOOL_FAILURE_LIMIT} 次动作都没能执行，已主动结束本轮。请检查设置、目标区域或当前画面后重新下达任务。`,
+          createdAt: Date.now(),
+        });
+        logClientEvent("round.aborted_after_failures", {
+          operationId,
+          roundId,
+          requestIndex,
+          toolCallCount,
+          toolFailureStreak,
+          failureCode: lastToolFailureCode,
+        }, "warn");
+        setNotice(`连续 ${TOOL_FAILURE_LIMIT} 次动作未能执行，已结束本轮`);
+        return false;
+      }
       if (!region) {
         if (usedInput) throw new Error("操作后截图缺少目标区域");
         continue;
       }
-      if (usedInput && !settings.autoCaptureAfterTool) {
-        if (toolCalls[0]?.function.name === "wait" && postActionDelayMs !== null) {
-          const delayCompleted = await sleepWithCancel(
-            postActionDelayMs,
-            () => operationRef.current !== operationId,
-          );
-          if (!delayCompleted) throw new Error("本轮请求已取消");
-        }
+      const respondedTool = toolCalls[0]?.function.name;
+      if (usedInput && !settings.autoCaptureAfterTool && respondedTool !== "wait") {
         setNotice("工具已执行，工具后自动截图已关闭");
         return false;
       }
-      if (usedInput) {
-        const captureDelayMs = postActionDelayMs
-          ?? Math.max(500, settings.operationCaptureDelay * 1000);
-        if (postActionNotice) {
-          setNotice(postActionNotice);
-        } else if (postActionDelayMs === null) {
-          setNotice(`等待游戏画面稳定（${settings.operationCaptureDelay} 秒）...`);
-        }
-        const delayCompleted = await sleepWithCancel(
-          captureDelayMs,
-          () => operationRef.current !== operationId,
-        );
-        if (!delayCompleted) throw new Error("本轮请求已取消");
-      } else {
+      if (!usedInput) {
         setNotice("工具调用未执行，正在刷新当前画面...");
+      } else if (respondedTool !== "wait") {
+        setNotice(`正在观察画面变化，最迟 ${formatDeadlineSeconds(observeDeadlineMs)} 秒后返回新截图...`);
       }
-      const rawScreenshot = await captureRegion(region, {
+      if (operationRef.current !== operationId) throw new Error("本轮请求已取消");
+      const observed = usedInput
+        ? await observeRegion(region, {
+            operationId,
+            roundId,
+            captureKind: respondedTool === "wait" ? "wait" : "operation-result",
+            toolStep: toolCallCount,
+            deadlineMs: observeDeadlineMs,
+            probeEnabled: observeProbeEnabled,
+            markerX: lastActionMarker?.x,
+            markerY: lastActionMarker?.y,
+            markerFromX: lastActionMarker?.fromX,
+            markerFromY: lastActionMarker?.fromY,
+          })
+        : null;
+      const rawScreenshot = observed ?? await captureRegion(region, {
         operationId,
         roundId,
         captureKind: "operation-result",
@@ -940,6 +996,10 @@ function App() {
         markerFromX: lastActionMarker?.fromX,
         markerFromY: lastActionMarker?.fromY,
       });
+      if (operationRef.current !== operationId) throw new Error("本轮请求已取消");
+      if (observed) {
+        earlyWakePending = pausedObservationRemainder(observeDeadlineMs, observed);
+      }
       const resultAttachment = createAttachment(
         rawScreenshot.dataUrl,
         "tool",
@@ -967,7 +1027,7 @@ function App() {
     attachments: Attachment[];
     conversationId?: string;
   }) => {
-    if (busyRef.current) return;
+    if (!storageReady || busyRef.current || captureBusyRef.current) return;
     if (replyCaptureTimerRef.current !== null) {
       window.clearTimeout(replyCaptureTimerRef.current);
       replyCaptureTimerRef.current = null;
@@ -1001,6 +1061,7 @@ function App() {
     operationRef.current = operationId;
     roundRef.current = roundId;
     busyRef.current = true;
+    runningConversationRef.current = baseConversation.id;
     setIsBusy(true);
     setIsCancelling(false);
     const conversationId = baseConversation.id;
@@ -1073,6 +1134,7 @@ function App() {
       if (operationRef.current === operationId) operationRef.current = null;
       if (roundRef.current === roundId) roundRef.current = null;
       busyRef.current = false;
+      runningConversationRef.current = null;
       setIsBusy(false);
       setIsCancelling(false);
       if (
@@ -1090,28 +1152,34 @@ function App() {
           region: scheduledRegion,
         });
         setNotice(`正式回复完成，${delaySeconds} 秒后截图开始下一轮`);
-        replyCaptureTimerRef.current = window.setTimeout(() => {
+        replyCaptureTimerRef.current = window.setTimeout(async () => {
           replyCaptureTimerRef.current = null;
-          if (!replyCaptureEnabledRef.current || busyRef.current) return;
+          if (!replyCaptureEnabledRef.current || busyRef.current || captureBusyRef.current) return;
           const currentRegion = regionRef.current;
           if (!currentRegion) return;
-          void captureRegion(currentRegion, { captureKind: "reply" })
-            .then((capture) => {
-              if (busyRef.current || !replyCaptureEnabledRef.current) return;
-              return sendMessage({
-                text: "",
-                attachments: [createAttachment(capture.dataUrl, "reply", currentRegion, capture.frameId)],
-                conversationId,
-              });
-            })
-            .catch((error) => {
-              setNotice(`普通回复后截图失败：${String(error)}`);
-              logClientEvent("reply_capture.failed", {
-                conversationId,
-                completedRoundId: roundId,
-                error: String(error),
-              }, "error");
+          captureBusyRef.current = true;
+          setIsCapturing(true);
+          let capture;
+          try {
+            capture = await captureRegion(currentRegion, { captureKind: "reply" });
+          } catch (error) {
+            setNotice(`完全自动截图失败：${String(error)}`);
+            logClientEvent("reply_capture.failed", {
+              conversationId,
+              completedRoundId: roundId,
+              error: String(error),
+            }, "error");
+          } finally {
+            captureBusyRef.current = false;
+            setIsCapturing(false);
+          }
+          if (capture && !busyRef.current && replyCaptureEnabledRef.current) {
+            await sendMessage({
+              text: "",
+              attachments: [createAttachment(capture.dataUrl, "reply", currentRegion, capture.frameId)],
+              conversationId,
             });
+          }
         }, delaySeconds * 1000);
       }
     }
@@ -1122,7 +1190,7 @@ function App() {
     const roundId = roundRef.current;
     if (!operationId) {
       setReplyCaptureEnabled(false);
-      setNotice("已停止普通回复后截图");
+      setNotice("已停止完全自动");
       return;
     }
     setIsCancelling(true);
@@ -1181,6 +1249,7 @@ function App() {
   };
 
   const addConversation = () => {
+    if (!storageReady) return;
     const conversation = newConversation(conversations.length + 1);
     setConversations((current) => [conversation, ...current]);
     setActiveId(conversation.id);
@@ -1189,6 +1258,10 @@ function App() {
   };
 
   const deleteConversation = (id: string) => {
+    if (!storageReady || busyRef.current || captureBusyRef.current || replyCaptureEnabledRef.current) {
+      setNotice("请等待历史加载完成，并停止运行和自动截图后再删除会话");
+      return;
+    }
     if (conversations.length === 1) {
       const replacement = newConversation(1);
       setConversations([replacement]);
@@ -1204,7 +1277,7 @@ function App() {
     const statusTitle = isBusy
       ? "模型正在运行"
       : replyCaptureEnabled
-        ? "普通回复后截图已开启"
+        ? "完全自动已开启"
         : "VLM_Screenshot_Action 待机中";
     const statusDetail = isBusy
       ? notice
@@ -1222,7 +1295,7 @@ function App() {
         </div>
         <div className="mini-actions">
           {(isBusy || replyCaptureEnabled) && (
-            <button className="mini-stop" onClick={() => void stopFromCompanion()} title="停止当前任务和普通回复后截图；键盘输入期间可按 F8 急停">
+            <button className="mini-stop" onClick={() => void stopFromCompanion()} title="停止当前任务和完全自动；键盘输入期间可按 F8 急停">
               <CircleStop size={16} />
             </button>
           )}
@@ -1280,15 +1353,30 @@ function App() {
               <Minimize2 size={16} />
               <span>迷你模式</span>
             </button>
-            <button className="emergency-stop" onClick={() => void interruptRun()} title="键盘输入期间即使窗口隐藏，也可按 F8 急停">
+            <button className="emergency-stop" onClick={() => void interruptRun()} title="键盘输入或画面观察期间，即使窗口隐藏也可按 F8 急停">
               {isCancelling ? <LoaderCircle size={15} className="spin" /> : <CircleStop size={15} />}
               <span>{isBusy ? "中断运行 / F8" : "紧急停止 / F8"}</span>
             </button>
-            <button className="new-conversation" onClick={addConversation} title="新建会话">
+            <button className="new-conversation" disabled={!storageReady} onClick={addConversation} title="新建会话">
               <Plus size={21} />
             </button>
           </div>
         </header>
+
+        {storageError && (
+          <div className="storage-warning" role="alert">
+            <AlertTriangle size={16} />
+            <span>
+              <strong>历史保存失败</strong>
+              <small>
+                本机存储可能已满，新消息无法写入磁盘，重启后可能丢失。可删除旧会话后重试。详情：{storageError}
+              </small>
+            </span>
+            <button onClick={() => setStorageError(null)} title="知道了">
+              <X size={14} />
+            </button>
+          </div>
+        )}
 
         <div className="chat-scroll" ref={scrollRef}>
           {activeConversation.messages.length === 0 ? (
@@ -1320,10 +1408,10 @@ function App() {
             }}
           >
             {replyCaptureEnabled ? <Pause size={15} /> : <Camera size={15} />}
-            {replyCaptureEnabled ? "停止回复后截图" : "启用回复后截图"}
+            {replyCaptureEnabled ? "停止完全自动" : "启用完全自动"}
           </button>
-          <button onClick={chooseRegion}><Crop size={15} /> 选择截图范围</button>
-          <button onClick={() => void takeScreenshot()}><ImagePlus size={15} /> 手动截图</button>
+          <button disabled={isBusy || isCapturing} onClick={chooseRegion}><Crop size={15} /> 选择截图范围</button>
+          <button disabled={isBusy || isCapturing} onClick={() => void takeScreenshot()}><ImagePlus size={15} /> 手动截图</button>
         </div>
 
         <div className="composer-wrap">
@@ -1359,7 +1447,7 @@ function App() {
             />
             <button
               className="send-button"
-              disabled={isBusy || (!draft.trim() && pendingAttachments.length === 0)}
+              disabled={!storageReady || isBusy || isCapturing || (!draft.trim() && pendingAttachments.length === 0)}
               onClick={() => void sendMessage()}
             >
               {isBusy ? <LoaderCircle size={18} className="spin" /> : <Send size={18} />}
@@ -1411,7 +1499,9 @@ const toolCallLabel = (call: ToolCall) => {
   }
 };
 
-function MessageBubble({ message }: { message: Message }) {
+// Messages are immutable objects: a new one is only created for the message that
+// changed, so memo keeps an append from re-rendering every earlier screenshot.
+const MessageBubble = memo(function MessageBubble({ message }: { message: Message }) {
   if (message.role === "tool") return null;
 
   const hasToolCalls = Boolean(message.toolCalls?.length);
@@ -1426,7 +1516,13 @@ function MessageBubble({ message }: { message: Message }) {
       {message.attachments && message.attachments.length > 0 && (
         <div className="message-images">
           {message.attachments.map((attachment) => (
-            <img key={attachment.id} src={attachment.dataUrl} alt="游戏截图" />
+            <img
+              key={attachment.id}
+              src={attachment.dataUrl}
+              alt="游戏截图"
+              loading="lazy"
+              decoding="async"
+            />
           ))}
         </div>
       )}
@@ -1441,7 +1537,7 @@ function MessageBubble({ message }: { message: Message }) {
       )}
     </article>
   );
-}
+});
 
 function HistoryDrawer({
   conversations,
@@ -1559,7 +1655,7 @@ function SettingsPage({ settings, setSettings, showApiKey, setShowApiKey, onBack
                     className={settings.reasoningEffort === level ? "active" : ""}
                     onClick={() => patch("reasoningEffort", level)}
                   >
-                    {{ low: "低", high: "高", xhigh: "XHigh" }[level]}
+                    {{ low: "LOW", high: "HIGH", xhigh: "XHIGH" }[level]}
                   </button>
                 ))}
               </div>
@@ -1575,7 +1671,7 @@ function SettingsPage({ settings, setSettings, showApiKey, setShowApiKey, onBack
 
             <div className="settings-pair">
               <label className="range-field">
-                <span>最近截图循环数 <b>{settings.contextCycles}</b></span>
+                <span>最近截图循环数</span>
                 <input
                   type="number"
                   min="1"
@@ -1604,7 +1700,7 @@ function SettingsPage({ settings, setSettings, showApiKey, setShowApiKey, onBack
 
             <div className="settings-pair">
               <label className="range-field">
-                <span>普通回复后截图 <b>{settings.replyCaptureDelay} 秒</b></span>
+                <span>完全自动间隔 <b>{settings.replyCaptureDelay} 秒</b></span>
                 <input
                   type="range"
                   min="5"
@@ -1616,16 +1712,16 @@ function SettingsPage({ settings, setSettings, showApiKey, setShowApiKey, onBack
                 <small>模型正式回复结束本次运行后等待一次，再截图并创建新的运行；默认 15 秒</small>
               </label>
               <label className="range-field">
-                <span>工具操作后截图 <b>{settings.operationCaptureDelay} 秒</b></span>
+                <span>动作后等待时间 <b>{settings.operationCaptureDelay} 秒</b></span>
                 <input
                   type="range"
                   min="0.5"
-                  max="20"
+                  max="120"
                   step="0.5"
                   value={settings.operationCaptureDelay}
                   onChange={(event) => patch("operationCaptureDelay", Number(event.target.value))}
                 />
-                <small>工具操作后等待画面稳定，再发送新截图；鼠标操作可附落点或拖拽标记，默认等待 7 秒</small>
+                <small>唯一的等待计时器：动作后开始倒计时，画面趋稳提前唤醒；早醒后模型选 wait 则从暂停点继续剩余时间（无探测），做出动作则重置。默认 8 秒</small>
               </label>
             </div>
 
@@ -1644,6 +1740,12 @@ function SettingsPage({ settings, setSettings, showApiKey, setShowApiKey, onBack
                   "autoCaptureAfterTool",
                   !settings.autoCaptureAfterTool,
                 )}
+              />
+              <ToggleRow
+                checked={settings.earlyProbeEnabled}
+                title="提前探测"
+                detail="等待期间本地持续检测画面，变化趋稳时提前唤醒模型；关闭后退回纯定时器等待"
+                onToggle={() => patch("earlyProbeEnabled", !settings.earlyProbeEnabled)}
               />
             </div>
 

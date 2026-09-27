@@ -36,17 +36,17 @@ The latest screenshot is overlaid with a red cross / drag trajectory marking the
 
 | Mechanism | Effect |
 |-----------|--------|
-| F8 global panic stop | Holding F8 at any moment during keyboard input interrupts immediately; the stop latches and never auto-resumes |
+| F8 global panic stop | Holding F8 during keyboard input or while waiting for the screen interrupts immediately; the stop latches and never auto-resumes. Other phases (network request, full-auto interval, click/drag/hover) need the on-screen stop button |
 | Keyboard safety lock | Keyboard actions require frameId, capture region, and foreground window to all match the latest capture; a capture older than 5 minutes or a changed foreground window aborts safely |
 | Auto window evasion | The main window hides itself before capture and before actions — no occlusion, no focus stealing |
-| Redacted logging | JSONL logs `[redact]` API keys, screenshot base64, and conversation content; 2MB rotation ×4 archives |
+| Redacted logging | JSONL logs redact sensitive fields by name, such as API keys, screenshot base64, and conversation text (`[redacted]`); 2MB rotation ×4 archives. Redaction matches a field-name list and cannot cover arbitrary error strings, so review logs before sharing |
 | Cancellation propagation | An interrupt cascades to in-flight API requests, input actions, and idle-loop timers; combo keys release in reverse order |
 
 See [SECURITY.md](SECURITY.md) for details.
 
 ### 6. Tauri monolith + restrained dependencies
 
-About 5,100 lines of source today (TypeScript ≈ 2,900 + Rust ≈ 2,200), no Electron / Node.js runtime bundling, standard NSIS / MSI installers. The frontend is just React + lucide icons; the Rust side is enigo + xcap + reqwest with no framework-level abstraction — the core logic stays readable and portable.
+About 6,800 lines of source today (TypeScript ≈ 3,200 + Rust ≈ 3,600), no Electron / Node.js runtime bundling, a standard NSIS installer. The frontend is just React + lucide icons; the Rust side is enigo + xcap + reqwest with no framework-level abstraction — the core logic stays readable and portable.
 
 ### Tool protocol
 
@@ -60,20 +60,43 @@ Seven OpenAI function-calling tools (click / drag / hover / keyboard_type / keyb
 
 ```mermaid
 flowchart TD
-    A([You select a screen region and describe the task]) --> B[The app screenshots that region and sends it to the AI with the task]
-    B --> C{The AI looks at the image and thinks: what is next?}
-    C -- an action is needed --> D[Act: click, drag, hover, type, or wait]
-    D --> E[Wait for the screen to settle, then take a fresh screenshot<br/>with a red mark showing where it just acted]
-    E --> C
-    C -- task done or needs your decision --> F([The AI replies with a text summary; this round ends])
-    F --> G{Screenshot-after-reply enabled?}
-    G -- yes: idle mode --> H[After a delay, auto-screenshot starts the next round]
-    H --> C
-    G -- no --> I([Stop and wait for your next instruction])
-    J[Hold F8 at any time: stop everything immediately] -.-> C
+    A([You take a screenshot by hand, write the task, then send<br/>with full auto on, the timer also starts rounds on its own]) --> B[Screenshot the target region and send it along with the task<br/>only the newest image travels, older ones become a placeholder line]
+    B --> C{The AI looks at the image: what should it do next?}
+    C -- replies with text, calls no tool --> R[Store that text in the conversation<br/>the round ends here]
+    C -- calls end_round to say the round is over --> R
+    C -- calls one action tool --> D{Can this step run right now?}
+    D -- the tools toggle is off, or there is no usable image yet --> D2[This step did not happen<br/>the reason goes back to the AI]
+    D -- the action is not allowed, or it broke while running --> D3[This step failed<br/>the reason goes back to the AI]
+    D2 --> I2[Take a fresh screenshot right away, no waiting]
+    D3 --> I2
+    I2 --> I3{Three steps in a row that could not run?}
+    I3 -- yes --> I4([End the round on its own and explain why in the conversation])
+    I3 -- no --> J
+    D -- yes --> E[Act: click, drag, hover, type, press a key, or wait a while longer]
+    E --> E2[Remember where it acted and mark that spot with a red dot<br/>typing and key presses get no red dot]
+    E2 --> H{Is auto-screenshot after tools on?}
+    H -- no, and this step was not a wait --> H2([The round stops; it waits for you to capture by hand])
+    H -- yes --> I[Hide the window first and wait for the screen to change, then settle<br/>capture early once it settles, or at the latest when the time is up]
+    I --> J[The new screenshot becomes the starting point of the next cycle]
+    J --> C
+    R --> K{Is full auto on?}
+    K -- yes --> L[Wait the set interval, then an auto-screenshot starts the next round] --> B
+    K -- no --> M([Stop and wait for your next instruction])
+    N[Hold F8 during keyboard input or while waiting for the screen: stop at once<br/>use the on-screen stop button in any other phase] -.-> C
 ```
 
 The whole app simply makes the AI repeat a "look → act → look again to verify" loop until the task is done or you stop it. Each step sends only the latest screenshot (older ones become a one-line placeholder) to control cost; the internals are explained in the design decisions above.
+
+Details that the diagram leaves out but the code really does:
+
+- **One action per turn.** The model sometimes returns several tool calls at once; only the first is executed and the rest are dropped.
+- **Three steps in a row that cannot run end the round by themselves.** Steps that could not execute (tools off, no usable frame, invalid arguments, an error while running) add up; a single success in between clears the count, so ordinary runs are never cut short. Before this guard existed, a model that kept returning calls that could not run would loop forever (`toolFailureGuard.ts`).
+- **Failed steps do not consume the wait.** A step that was not executed or failed never starts the wait timer; the app grabs a fresh screenshot right away and asks the model again (`App.tsx:959-979`). Only an action that truly ran goes on to "wait for the screen to settle", and only that successful path clears the remainder left over from an early wake (`App.tsx:834-835`).
+- **A `wait` after an early wake resumes from the pause point.** If the screen changes and then settles during the wait, the model is woken early and the remaining time is stored; if it then picks `wait`, that remaining time is used to keep waiting (with no further probing), while any other action restarts the full timer (`observationTimer.ts:3`).
+- **Turning off early probing** falls back to a plain timer: sleep the configured time and take one screenshot, with no early wake.
+- **A brand-new round needs a screenshot of its own before the model gets any tools.** Only three attachment sources count as an actionable frame: manual capture, full auto, and the capture taken after a tool ran; an image you upload from a file is reference only and never counts (`model.ts:248-253`). So a first round where you only selected a region and typed a message offers no tools at all and the model can only reply with text; the tools appear once a later round carries a capture.
+- **A failed request is retried once** (3 s apart by default), with the request timeout configurable (60 s by default).
+- **With no region selected at all**, no tools are offered to the model, so it can only reply with text; if it returns a tool call anyway, that call is recorded as not executed and the loop goes straight back to the model without a screenshot, since there is no region to capture (`App.tsx:950-953`).
 
 ### Module Map
 
@@ -137,7 +160,7 @@ npm run tauri build   # installers land in src-tauri/target/release/bundle/
 | `hover` | Hover (wait for tooltip) | `x, y` |
 | `keyboard_type` | Type literal Unicode text | `text` (≤10000 chars), `intervalMs`, `submit` |
 | `keyboard_press` | Physical keys / combos | `keys[]` (1–8), `holdMs` |
-| `wait` | Wait for the screen to change | `seconds` (1–60) |
+| `wait` | Wait for the screen to change | none (no duration to specify) |
 | `end_round` | End this run | `message` (summary for the user) |
 
 ---
@@ -150,8 +173,8 @@ npm run tauri build   # installers land in src-tauri/target/release/bundle/
 | Model | `gpt-4o-mini` | must support vision and function calling |
 | Reasoning Effort | `low` | `low` / `high` / `xhigh`, passed through |
 | Context cycles | `3` | 1–999, rolling window size |
-| Delay after action | `7` s | 0.5–20 s, wait for a stable frame |
-| Delay after reply | `15` s | 5–120 s, idle-loop interval |
+| Delay after action | `8` s | 0.5–120 s, wait for a stable frame |
+| Idle interval | `15` s | 5–120 s, full-auto loop interval |
 | Request timeout | `60` s | 5–300 s |
 | Retry on failure | on, 3 s apart | 0–15 s, at most one retry |
 | Enable tools | on | off = conversation only |
@@ -183,7 +206,7 @@ npm run check          # TS typecheck + frontend unit tests
 npm run test:rust      # cargo test for desktop-core and src-tauri
 npm run fmt:rust:check # Rust formatting check
 npm run tauri dev      # dev mode
-npm run package:public # build the portable archive
+npm run tauri build    # build the NSIS installer
 ```
 
 Runtime logs live in `vlm_screenshot_action.log` under the system application-log directory.

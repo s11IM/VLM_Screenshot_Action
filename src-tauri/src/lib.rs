@@ -80,9 +80,43 @@ struct CapturedFrame {
     created: Instant,
 }
 
+struct BaselineFrame {
+    region: Region,
+    thumb: desktop::observe::GrayImage,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TriggerInfo {
+    changed_at_ms: u64,
+    settled_at_ms: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ObservedImage {
+    data_url: String,
+    frame_id: String,
+    outcome: String,
+    waited_ms: u64,
+    samples: u32,
+    trigger: Option<TriggerInfo>,
+}
+
+struct ObservationCapture {
+    image: xcap::image::RgbaImage,
+    foreground: usize,
+    thumb: desktop::observe::GrayImage,
+    outcome: String,
+    waited_ms: u64,
+    samples: u32,
+    trigger: Option<TriggerInfo>,
+}
+
 #[derive(Default)]
 struct CaptureState {
     frame: Mutex<Option<CapturedFrame>>,
+    baseline: Mutex<Option<BaselineFrame>>,
 }
 
 impl CaptureState {
@@ -185,6 +219,11 @@ impl OperationState {
     }
 }
 
+// Windows keeps painting a hidden window while it fades out. Capturing or
+// sampling before the animation finishes can record the app window itself as a
+// screen change, so every path that hides the window waits this long first.
+const WINDOW_HIDE_SETTLE_MS: u64 = 500;
+
 fn hide_window_for_background_action(window: &WebviewWindow) -> Result<WindowPresentation, String> {
     let minimized = window.is_minimized().unwrap_or(false);
     let visible = window.is_visible().unwrap_or(true);
@@ -209,7 +248,19 @@ fn restore_window_after_background_action(
     if !presentation.hidden_for_action {
         return;
     }
-    let _ = window.show();
+    if let Err(error) = window.show() {
+        log_event(
+            "error",
+            "window.restore_failed",
+            json!({ "error": error.to_string() }),
+        );
+        return;
+    }
+    log_event(
+        "debug",
+        "window.restored",
+        json!({ "restoreFocus": restore_focus }),
+    );
     if presentation.maximized {
         let _ = window.maximize();
     } else {
@@ -222,6 +273,31 @@ fn restore_window_after_background_action(
         let _ = window.minimize();
     } else if restore_focus && presentation.focused {
         let _ = window.set_focus();
+    }
+}
+
+// Use the same cleanup on completion, error, and dropped command futures.
+struct WindowRestoreGuard<F: FnOnce()> {
+    restore: Option<F>,
+}
+
+impl<F: FnOnce()> WindowRestoreGuard<F> {
+    fn new(restore: F) -> Self {
+        Self {
+            restore: Some(restore),
+        }
+    }
+
+    fn restore(self) {
+        drop(self);
+    }
+}
+
+impl<F: FnOnce()> Drop for WindowRestoreGuard<F> {
+    fn drop(&mut self) {
+        if let Some(restore) = self.restore.take() {
+            restore();
+        }
     }
 }
 
@@ -504,7 +580,7 @@ fn exit_mini_mode(
     window: WebviewWindow,
     state: State<'_, WindowLayoutState>,
 ) -> Result<(), String> {
-    let layout = state.normal.lock().map_err(|_| "窗口状态不可用")?.take();
+    let layout = *state.normal.lock().map_err(|_| "窗口状态不可用")?;
     let Some(layout) = layout else {
         return Ok(());
     };
@@ -532,6 +608,7 @@ fn exit_mini_mode(
         .set_title("VLM_Screenshot_Action")
         .map_err(|error| error.to_string())?;
     let _ = window.set_focus();
+    *state.normal.lock().map_err(|_| "窗口状态不可用")? = None;
     log_event("info", "window.mini_mode_exited", json!({}));
     Ok(())
 }
@@ -619,8 +696,17 @@ async fn select_region(
     };
     *state.context.lock().map_err(|_| "区域选择状态不可用")? = Some(context);
 
-    window.hide().map_err(|error| error.to_string())?;
-    thread::sleep(Duration::from_millis(100));
+    let presentation = hide_window_for_background_action(&window)?;
+    let restore_guard = WindowRestoreGuard::new(|| {
+        if let Ok(mut pending) = state.pending.lock() {
+            *pending = None;
+        }
+        if let Ok(mut context) = state.context.lock() {
+            *context = None;
+        }
+        restore_window_after_background_action(&window, presentation, true);
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
 
     if let Some(existing) = app.get_webview_window("region-selector") {
         let _ = existing.close();
@@ -651,12 +737,12 @@ async fn select_region(
                 "region.selector_window_failed",
                 json!({ "error": error.to_string() }),
             );
-            let _ = window.show();
-            let _ = window.set_focus();
-            *state.context.lock().map_err(|_| "区域选择状态不可用")? = None;
             return Err(error.to_string());
         }
     };
+    let selector_guard = WindowRestoreGuard::new(|| {
+        let _ = selector.close();
+    });
 
     // Builder coordinates are logical pixels. Reapply the target monitor geometry in
     // physical pixels so mixed-DPI and non-zero monitor origins cannot shift the overlay.
@@ -674,25 +760,20 @@ async fn select_region(
             "region.selector_geometry_failed",
             json!({ "error": error.to_string() }),
         );
-        let _ = selector.close();
-        let _ = window.show();
-        let _ = window.set_focus();
-        *state.context.lock().map_err(|_| "区域选择状态不可用")? = None;
         return Err(error.to_string());
     }
 
-    selector.show().map_err(|error| error.to_string())?;
-    selector.set_focus().map_err(|error| error.to_string())?;
     let (sender, receiver) = oneshot::channel();
     *state.pending.lock().map_err(|_| "区域选择状态不可用")? = Some(sender);
+    selector.show().map_err(|error| error.to_string())?;
+    selector.set_focus().map_err(|error| error.to_string())?;
 
     let result = match receiver.await {
         Ok(result) => result,
         Err(_) => Err("区域选择窗口意外关闭".to_string()),
     };
-    let _ = selector.close();
-    let _ = window.show();
-    let _ = window.set_focus();
+    selector_guard.restore();
+    restore_guard.restore();
     match &result {
         Ok(region) => log_event(
             "info",
@@ -947,27 +1028,30 @@ async fn capture_region(
         return Err(error);
     }
     let presentation = hide_window_for_background_action(&window)?;
+    let restore_guard = WindowRestoreGuard::new(move || {
+        restore_window_after_background_action(&window, presentation, false);
+    });
     if presentation.hidden_for_action {
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
     }
 
     let capture_result = (|| {
         let foreground = desktop::foreground_window();
         let mut image = desktop::capture_region(region)?;
         let stable_foreground = foreground != 0 && foreground == desktop::foreground_window();
-        if let (Some(mx), Some(my)) = (marker_x, marker_y) {
-            let cx = ((region.width.saturating_sub(1) as f64) * mx as f64 / 1000.0).round() as i32;
-            let cy = ((region.height.saturating_sub(1) as f64) * my as f64 / 1000.0).round() as i32;
-            if let (Some(fx), Some(fy)) = (marker_from_x, marker_from_y) {
-                let start_x =
-                    ((region.width.saturating_sub(1) as f64) * fx as f64 / 1000.0).round() as i32;
-                let start_y =
-                    ((region.height.saturating_sub(1) as f64) * fy as f64 / 1000.0).round() as i32;
-                draw_drag_trail(&mut image, start_x, start_y, cx, cy);
-            } else {
-                draw_crosshair(&mut image, cx, cy);
-            }
-        }
+        // Unmarked frame: the next observation compares live pixels, not the model overlay.
+        let thumb = desktop::observe::downscale_gray(
+            &image,
+            desktop::observe::ObserveParams::default().long_edge,
+        );
+        draw_region_markers(
+            &mut image,
+            region,
+            marker_x,
+            marker_y,
+            marker_from_x,
+            marker_from_y,
+        );
         let mut bytes = Vec::new();
         DynamicImage::ImageRgba8(image)
             .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
@@ -979,13 +1063,15 @@ async fn capture_region(
             foreground: if stable_foreground { foreground } else { 0 },
             created: Instant::now(),
         });
+        *captures.baseline.lock().map_err(|_| "截图状态不可用")? =
+            Some(BaselineFrame { region, thumb });
         Ok::<_, String>(CapturedImage {
             data_url: format!("data:image/png;base64,{}", STANDARD.encode(bytes)),
             frame_id,
         })
     })();
 
-    restore_window_after_background_action(&window, presentation, false);
+    restore_guard.restore();
     match &capture_result {
         Ok(image) => log_event(
             "info",
@@ -1015,6 +1101,469 @@ async fn capture_region(
         ),
     }
     capture_result
+}
+
+fn clamp_deadline_ms(deadline_ms: u64) -> u64 {
+    // Resuming a paused timer must preserve sub-500ms (including zero) remainders.
+    deadline_ms.min(120_000)
+}
+
+fn next_interval(
+    current: u64,
+    sample_cost_ms: u64,
+    params: &desktop::observe::ObserveParams,
+) -> u64 {
+    if sample_cost_ms <= params.sample_cost_threshold_ms {
+        return current;
+    }
+    if current < params.slow_interval_ms {
+        params.slow_interval_ms
+    } else if current < params.slowest_interval_ms {
+        params.slowest_interval_ms
+    } else {
+        current
+    }
+}
+
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn observation_should_stop(cancelled: &AtomicBool, emergency_stop: bool) -> bool {
+    if emergency_stop {
+        cancelled.store(true, Ordering::SeqCst);
+    }
+    cancelled.load(Ordering::SeqCst)
+}
+
+fn check_observation_cancelled(cancelled: &AtomicBool) -> Result<(), String> {
+    if observation_should_stop(cancelled, desktop::keyboard_emergency_stop_pressed()) {
+        Err("本轮操作已取消".into())
+    } else {
+        Ok(())
+    }
+}
+
+fn interruptible_sleep(total: Duration, cancelled: &AtomicBool) -> Result<(), String> {
+    let started = Instant::now();
+    loop {
+        check_observation_cancelled(cancelled)?;
+        let Some(remaining) = total.checked_sub(started.elapsed()) else {
+            return Ok(());
+        };
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+}
+
+fn draw_region_markers(
+    image: &mut xcap::image::RgbaImage,
+    region: Region,
+    marker_x: Option<i32>,
+    marker_y: Option<i32>,
+    marker_from_x: Option<i32>,
+    marker_from_y: Option<i32>,
+) {
+    let (Some(mx), Some(my)) = (marker_x, marker_y) else {
+        return;
+    };
+    let cx = ((region.width.saturating_sub(1) as f64) * mx as f64 / 1000.0).round() as i32;
+    let cy = ((region.height.saturating_sub(1) as f64) * my as f64 / 1000.0).round() as i32;
+    if let (Some(fx), Some(fy)) = (marker_from_x, marker_from_y) {
+        let start_x = ((region.width.saturating_sub(1) as f64) * fx as f64 / 1000.0).round() as i32;
+        let start_y =
+            ((region.height.saturating_sub(1) as f64) * fy as f64 / 1000.0).round() as i32;
+        draw_drag_trail(image, start_x, start_y, cx, cy);
+    } else {
+        draw_crosshair(image, cx, cy);
+    }
+}
+
+fn encode_png_data_url(image: xcap::image::RgbaImage) -> Result<(String, usize), String> {
+    let mut bytes = Vec::new();
+    DynamicImage::ImageRgba8(image)
+        .write_to(&mut Cursor::new(&mut bytes), ImageFormat::Png)
+        .map_err(|error| error.to_string())?;
+    let encoded_bytes = bytes.len();
+    Ok((
+        format!("data:image/png;base64,{}", STANDARD.encode(bytes)),
+        encoded_bytes,
+    ))
+}
+
+fn run_observation(
+    region: Region,
+    deadline: Duration,
+    probe_enabled: bool,
+    stored_baseline: Option<desktop::observe::GrayImage>,
+    cancelled: Arc<AtomicBool>,
+    started: Instant,
+) -> Result<ObservationCapture, String> {
+    let params = desktop::observe::ObserveParams::default();
+    if !probe_enabled {
+        interruptible_sleep(deadline.saturating_sub(started.elapsed()), &cancelled)?;
+        let foreground_before = desktop::foreground_window();
+        let image = desktop::capture_region(region)?;
+        let foreground_after = desktop::foreground_window();
+        let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
+        check_observation_cancelled(&cancelled)?;
+        let foreground = if foreground_before != 0 && foreground_before == foreground_after {
+            foreground_before
+        } else {
+            0
+        };
+        return Ok(ObservationCapture {
+            image,
+            foreground,
+            thumb,
+            outcome: "deadline".into(),
+            waited_ms: elapsed_ms(started),
+            samples: 0,
+            trigger: None,
+        });
+    }
+
+    let baseline = match stored_baseline {
+        Some(thumb) => thumb,
+        None => {
+            check_observation_cancelled(&cancelled)?;
+            let image = desktop::capture_region(region)?;
+            desktop::observe::downscale_gray(&image, params.long_edge)
+        }
+    };
+    let mut detector = desktop::observe::SettleDetector::new(params, baseline);
+    let mut interval = params.sample_interval_ms;
+    let mut sample_elapsed = Vec::new();
+
+    loop {
+        check_observation_cancelled(&cancelled)?;
+        if started.elapsed() >= deadline {
+            let foreground_before = desktop::foreground_window();
+            let image = desktop::capture_region(region)?;
+            let foreground_after = desktop::foreground_window();
+            let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
+            check_observation_cancelled(&cancelled)?;
+            let foreground = if foreground_before != 0 && foreground_before == foreground_after {
+                foreground_before
+            } else {
+                0
+            };
+            return Ok(ObservationCapture {
+                image,
+                foreground,
+                thumb,
+                outcome: "deadline".into(),
+                waited_ms: elapsed_ms(started),
+                samples: u32::try_from(sample_elapsed.len()).unwrap_or(u32::MAX),
+                trigger: None,
+            });
+        }
+
+        let sample_started = Instant::now();
+        let foreground_before = desktop::foreground_window();
+        let image = desktop::capture_region(region)?;
+        let foreground_after = desktop::foreground_window();
+        let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
+        let sample_outcome = detector.on_sample(&thumb);
+        let sample_cost_ms =
+            u64::try_from(sample_started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let now_ms = elapsed_ms(started);
+        sample_elapsed.push(now_ms);
+        let foreground = if foreground_before != 0 && foreground_before == foreground_after {
+            foreground_before
+        } else {
+            0
+        };
+        let metrics = &sample_outcome.metrics;
+        if !(metrics.state == "armed"
+            && metrics.changed_fraction == 0.0
+            && metrics.motion_fraction == 0.0)
+        {
+            log_event(
+                "debug",
+                "observation.sample",
+                json!({
+                    "index": metrics.index,
+                    "changedFraction": metrics.changed_fraction,
+                    "motionFraction": metrics.motion_fraction,
+                    "topDecileMean": metrics.top_decile_mean,
+                    "globalMeanShift": metrics.global_mean_shift,
+                    "state": metrics.state,
+                    "sampleCostMs": sample_cost_ms,
+                    "elapsedMs": now_ms,
+                    "intervalMs": interval,
+                }),
+            );
+        }
+        check_observation_cancelled(&cancelled)?;
+        let deadline_reached = started.elapsed() >= deadline;
+        if sample_outcome.triggered || deadline_reached {
+            let changed_at_ms = detector
+                .changed_at_sample()
+                .and_then(|index| sample_elapsed.get(index as usize).copied())
+                .unwrap_or(now_ms);
+            return Ok(ObservationCapture {
+                image,
+                foreground,
+                thumb,
+                outcome: if deadline_reached {
+                    "deadline"
+                } else {
+                    "early_wake"
+                }
+                .into(),
+                waited_ms: elapsed_ms(started),
+                samples: u32::try_from(sample_elapsed.len()).unwrap_or(u32::MAX),
+                trigger: (!deadline_reached).then_some(TriggerInfo {
+                    changed_at_ms,
+                    settled_at_ms: elapsed_ms(started),
+                }),
+            });
+        }
+        interval = next_interval(interval, sample_cost_ms, detector.params());
+        let remaining = deadline.saturating_sub(started.elapsed());
+        interruptible_sleep(Duration::from_millis(interval).min(remaining), &cancelled)?;
+    }
+}
+
+#[tauri::command]
+async fn observe_region(
+    window: WebviewWindow,
+    region: Region,
+    operation_id: Option<String>,
+    round_id: Option<String>,
+    capture_kind: Option<String>,
+    tool_step: Option<u32>,
+    deadline_ms: u64,
+    probe_enabled: bool,
+    marker_x: Option<i32>,
+    marker_y: Option<i32>,
+    marker_from_x: Option<i32>,
+    marker_from_y: Option<i32>,
+    state: State<'_, OperationState>,
+    captures: State<'_, CaptureState>,
+) -> Result<ObservedImage, String> {
+    let started = Instant::now();
+    let deadline = clamp_deadline_ms(deadline_ms);
+    let log_context = json!({
+        "operationId": operation_id,
+        "roundId": round_id,
+        "captureKind": capture_kind,
+        "toolStep": tool_step,
+        "deadlineMs": deadline_ms,
+        "probeEnabled": probe_enabled,
+        "region": region_metadata(region),
+    });
+    log_event("info", "observation.started", log_context);
+    if let Err(error) = monitor_for_region(region) {
+        log_event(
+            "error",
+            "observation.failed",
+            json!({
+                "error": error,
+                "durationMs": started.elapsed().as_millis(),
+                "operationId": operation_id,
+                "roundId": round_id,
+                "captureKind": capture_kind,
+                "toolStep": tool_step,
+                "region": region_metadata(region),
+            }),
+        );
+        return Err(error);
+    }
+    let cancelled = if let Some(id) = operation_id.as_deref() {
+        match state.flag(id) {
+            Ok(flag) => flag,
+            Err(error) => {
+                log_event(
+                    "error",
+                    "observation.failed",
+                    json!({
+                        "error": error,
+                        "durationMs": started.elapsed().as_millis(),
+                        "operationId": operation_id,
+                        "roundId": round_id,
+                        "captureKind": capture_kind,
+                        "toolStep": tool_step,
+                        "region": region_metadata(region),
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        Arc::new(AtomicBool::new(false))
+    };
+    check_observation_cancelled(&cancelled)?;
+    *captures.frame.lock().map_err(|_| "截图状态不可用")? = None;
+    let presentation = match hide_window_for_background_action(&window) {
+        Ok(presentation) => presentation,
+        Err(error) => {
+            log_event(
+                "error",
+                "observation.failed",
+                json!({
+                    "error": error,
+                    "durationMs": started.elapsed().as_millis(),
+                    "operationId": operation_id,
+                    "roundId": round_id,
+                    "captureKind": capture_kind,
+                    "toolStep": tool_step,
+                    "region": region_metadata(region),
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let restore_guard = WindowRestoreGuard::new(move || {
+        restore_window_after_background_action(&window, presentation, false);
+    });
+    if presentation.hidden_for_action {
+        tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
+    }
+    let stored_baseline = if probe_enabled {
+        match captures.baseline.lock() {
+            Ok(guard) => guard
+                .as_ref()
+                .filter(|frame| frame.region == region)
+                .map(|frame| frame.thumb.clone()),
+            Err(_) => {
+                let error = "截图状态不可用".to_string();
+                log_event(
+                    "error",
+                    "observation.failed",
+                    json!({
+                        "error": error,
+                        "durationMs": started.elapsed().as_millis(),
+                        "operationId": operation_id,
+                        "roundId": round_id,
+                        "captureKind": capture_kind,
+                        "toolStep": tool_step,
+                        "region": region_metadata(region),
+                    }),
+                );
+                return Err(error);
+            }
+        }
+    } else {
+        None
+    };
+    let loop_result = tauri::async_runtime::spawn_blocking(move || {
+        run_observation(
+            region,
+            Duration::from_millis(deadline),
+            probe_enabled,
+            stored_baseline,
+            cancelled,
+            started,
+        )
+    })
+    .await
+    .map_err(|error| error.to_string());
+    restore_guard.restore();
+    let observed = match loop_result {
+        Ok(Ok(observed)) => observed,
+        Ok(Err(error)) | Err(error) => {
+            log_event(
+                "error",
+                "observation.failed",
+                json!({
+                    "error": error,
+                    "durationMs": started.elapsed().as_millis(),
+                    "operationId": operation_id,
+                    "roundId": round_id,
+                    "captureKind": capture_kind,
+                    "toolStep": tool_step,
+                    "region": region_metadata(region),
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let mut image = observed.image;
+    draw_region_markers(
+        &mut image,
+        region,
+        marker_x,
+        marker_y,
+        marker_from_x,
+        marker_from_y,
+    );
+    let (data_url, encoded_bytes) = match encode_png_data_url(image) {
+        Ok(encoded) => encoded,
+        Err(error) => {
+            log_event(
+                "error",
+                "observation.failed",
+                json!({
+                    "error": error,
+                    "durationMs": started.elapsed().as_millis(),
+                    "operationId": operation_id,
+                    "roundId": round_id,
+                    "captureKind": capture_kind,
+                    "toolStep": tool_step,
+                    "region": region_metadata(region),
+                }),
+            );
+            return Err(error);
+        }
+    };
+    let frame_id = format!("frame-{}", uuid::Uuid::new_v4());
+    if let Err(error) = (|| {
+        *captures.frame.lock().map_err(|_| "截图状态不可用")? = Some(CapturedFrame {
+            id: frame_id.clone(),
+            region,
+            foreground: observed.foreground,
+            created: Instant::now(),
+        });
+        *captures.baseline.lock().map_err(|_| "截图状态不可用")? = Some(BaselineFrame {
+            region,
+            thumb: observed.thumb.clone(),
+        });
+        Ok::<(), String>(())
+    })() {
+        log_event(
+            "error",
+            "observation.failed",
+            json!({
+                "error": error,
+                "durationMs": started.elapsed().as_millis(),
+                "operationId": operation_id,
+                "roundId": round_id,
+                "captureKind": capture_kind,
+                "toolStep": tool_step,
+                "region": region_metadata(region),
+            }),
+        );
+        return Err(error);
+    }
+    let result = ObservedImage {
+        data_url,
+        frame_id,
+        outcome: observed.outcome.clone(),
+        waited_ms: observed.waited_ms,
+        samples: observed.samples,
+        trigger: observed.trigger.clone(),
+    };
+    log_event(
+        "info",
+        "observation.completed",
+        json!({
+            "outcome": result.outcome,
+            "waitedMs": result.waited_ms,
+            "samples": result.samples,
+            "trigger": result.trigger,
+            "encodedBytes": encoded_bytes,
+            "operationId": operation_id,
+            "roundId": round_id,
+            "captureKind": capture_kind,
+            "toolStep": tool_step,
+            "durationMs": started.elapsed().as_millis(),
+        }),
+    );
+    Ok(result)
 }
 
 fn normalized_coordinate(value: Option<i32>, name: &str) -> Result<i32, String> {
@@ -1081,6 +1630,9 @@ async fn execute_input_action(
         *captures.frame.lock().map_err(|_| "截图状态不可用")? = None;
     }
     let presentation = hide_window_for_background_action(&window)?;
+    let restore_guard = WindowRestoreGuard::new(move || {
+        restore_window_after_background_action(&window, presentation, false);
+    });
     if presentation.hidden_for_action {
         tokio::time::sleep(Duration::from_millis(120)).await;
     }
@@ -1094,7 +1646,6 @@ async fn execute_input_action(
             Ok(target) => Some(target),
             Err(error) => {
                 cancelled.store(true, Ordering::SeqCst);
-                restore_window_after_background_action(&window, presentation, false);
                 log_event(
                     "warn",
                     "input.validation_failed",
@@ -1192,7 +1743,7 @@ async fn execute_input_action(
     .map_err(|error| error.to_string());
 
     tokio::time::sleep(Duration::from_millis(180)).await;
-    restore_window_after_background_action(&window, presentation, false);
+    restore_guard.restore();
     let result = result?
         .map_err(|error| {
             if error.starts_with("Operation cancelled") {
@@ -1639,6 +2190,7 @@ pub fn run() {
             complete_region_selection,
             cancel_region_selection,
             capture_region,
+            observe_region,
             execute_input_action,
             request_chat_completion,
         ])
@@ -1649,6 +2201,44 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn window_restore_runs_once_on_normal_completion() {
+        let calls = std::cell::Cell::new(0);
+        let guard = WindowRestoreGuard::new(|| calls.set(calls.get() + 1));
+        guard.restore();
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn window_restore_runs_on_early_error() {
+        let calls = std::cell::Cell::new(0);
+        let result = (|| {
+            let _guard = WindowRestoreGuard::new(|| calls.set(calls.get() + 1));
+            Err::<(), _>("capture failed")?;
+            Ok::<_, &str>(())
+        })();
+        assert!(result.is_err());
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn window_restore_runs_when_pending_future_is_dropped() {
+        use std::{
+            future::Future,
+            task::{Context, Poll, Waker},
+        };
+        let calls = std::cell::Cell::new(0);
+        let mut future = Box::pin(async {
+            let _guard = WindowRestoreGuard::new(|| calls.set(calls.get() + 1));
+            std::future::pending::<()>().await;
+        });
+        let mut context = Context::from_waker(Waker::noop());
+        assert!(matches!(future.as_mut().poll(&mut context), Poll::Pending));
+        assert_eq!(calls.get(), 0);
+        drop(future);
+        assert_eq!(calls.get(), 1);
+    }
 
     fn captured_frame() -> CapturedFrame {
         CapturedFrame {
@@ -1670,6 +2260,7 @@ mod tests {
         let region = frame.region;
         let state = CaptureState {
             frame: Mutex::new(Some(frame)),
+            ..Default::default()
         };
         assert!(state.take_keyboard_target(None, region, 42).is_err());
         assert!(state
@@ -1709,6 +2300,7 @@ mod tests {
             let region = frame.region;
             let state = CaptureState {
                 frame: Mutex::new(Some(frame)),
+                ..Default::default()
             };
             assert!(state
                 .take_keyboard_target(Some("current-frame"), region, 42)
@@ -1816,5 +2408,130 @@ mod tests {
         assert_eq!(image_count, 1);
         assert_eq!(image_payload_chars, 26);
         assert_eq!(text_chars, 11);
+    }
+
+    fn matching_baseline(
+        stored: &Option<BaselineFrame>,
+        region: Region,
+    ) -> Option<desktop::observe::GrayImage> {
+        stored
+            .as_ref()
+            .filter(|frame| frame.region == region)
+            .map(|frame| frame.thumb.clone())
+    }
+
+    #[test]
+    fn observation_response_uses_frontend_field_names() {
+        let deadline = ObservedImage {
+            data_url: "data:image/png;base64,test".into(),
+            frame_id: "id".into(),
+            outcome: "deadline".into(),
+            waited_ms: 7000,
+            samples: 0,
+            trigger: None,
+        };
+        let value = serde_json::to_value(deadline).unwrap();
+        assert_eq!(value["dataUrl"], "data:image/png;base64,test");
+        assert_eq!(value["frameId"], "id");
+        assert_eq!(value["outcome"], "deadline");
+        assert_eq!(value["waitedMs"], 7000);
+        assert_eq!(value["samples"], 0);
+        assert!(value["trigger"].is_null());
+
+        let early = ObservedImage {
+            data_url: "data:image/png;base64,test".into(),
+            frame_id: "id".into(),
+            outcome: "early_wake".into(),
+            waited_ms: 900,
+            samples: 4,
+            trigger: Some(TriggerInfo {
+                changed_at_ms: 300,
+                settled_at_ms: 900,
+            }),
+        };
+        let value = serde_json::to_value(early).unwrap();
+        assert_eq!(value["outcome"], "early_wake");
+        assert_eq!(value["trigger"]["changedAtMs"], 300);
+        assert_eq!(value["trigger"]["settledAtMs"], 900);
+    }
+
+    #[test]
+    fn clamp_deadline_ms_bounds_wait() {
+        assert_eq!(clamp_deadline_ms(0), 0);
+        assert_eq!(clamp_deadline_ms(1), 1);
+        assert_eq!(clamp_deadline_ms(499), 499);
+        assert_eq!(clamp_deadline_ms(500), 500);
+        assert_eq!(clamp_deadline_ms(20_000), 20_000);
+        assert_eq!(clamp_deadline_ms(120_000), 120_000);
+        assert_eq!(clamp_deadline_ms(120_001), 120_000);
+    }
+
+    #[test]
+    fn observation_stop_latches_after_f8() {
+        let cancelled = AtomicBool::new(false);
+        assert!(!observation_should_stop(&cancelled, false));
+        assert!(observation_should_stop(&cancelled, true));
+        assert!(observation_should_stop(&cancelled, false));
+        assert!(observation_should_stop(&AtomicBool::new(true), false));
+    }
+
+    #[test]
+    fn observation_sleep_honors_cancellation_even_at_zero_deadline() {
+        assert!(interruptible_sleep(Duration::ZERO, &AtomicBool::new(true)).is_err());
+    }
+
+    #[test]
+    fn next_interval_slows_when_sample_cost_exceeds_threshold() {
+        let params = desktop::observe::ObserveParams::default();
+        assert_eq!(next_interval(150, 0, &params), 150);
+        assert_eq!(
+            next_interval(150, params.sample_cost_threshold_ms, &params),
+            150
+        );
+        assert_eq!(
+            next_interval(150, params.sample_cost_threshold_ms + 1, &params),
+            250
+        );
+        assert_eq!(
+            next_interval(250, params.sample_cost_threshold_ms + 1, &params),
+            400
+        );
+        assert_eq!(
+            next_interval(400, params.sample_cost_threshold_ms + 1, &params),
+            400
+        );
+        assert_eq!(next_interval(400, 0, &params), 400);
+    }
+
+    #[test]
+    fn baseline_roundtrip_is_independent_of_captured_frame() {
+        let region = Region {
+            x: 1,
+            y: 2,
+            width: 30,
+            height: 40,
+        };
+        let thumb = desktop::observe::GrayImage {
+            width: 2,
+            height: 2,
+            data: vec![1, 2, 3, 4],
+        };
+        let state = CaptureState::default();
+        *state.baseline.lock().unwrap() = Some(BaselineFrame {
+            region,
+            thumb: thumb.clone(),
+        });
+        let stored = state.baseline.lock().unwrap();
+        let frame = stored.as_ref().unwrap();
+        assert_eq!(frame.region, region);
+        assert_eq!(frame.thumb, thumb);
+        assert!(matching_baseline(&stored, region).is_some());
+        assert!(matching_baseline(&stored, Region { x: 9, ..region }).is_none());
+        drop(stored);
+
+        *state.frame.lock().unwrap() = None;
+        let stored = state.baseline.lock().unwrap();
+        assert_eq!(stored.as_ref().unwrap().region, region);
+        assert_eq!(stored.as_ref().unwrap().thumb, thumb);
     }
 }

@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
-import { captureRegion, executeInputAction } from "../tauri.ts";
+import { captureRegion, executeInputAction, observeRegion } from "../tauri.ts";
 
 test("carries the captured frame token into the input command", async () => {
   globalThis.window = {};
@@ -21,6 +21,41 @@ test("carries the captured frame token into the input command", async () => {
     assert.deepEqual(calls[1].payload.region, region);
     await executeInputAction(region, { type: "keyboard_type", text: "x" }, "op", "round", 2, "legacy");
     assert.equal(calls[2].payload.frameId, undefined);
+    const observation = {
+      dataUrl: capture.dataUrl,
+      frameId: "observed-frame",
+      outcome: "deadline",
+      waitedMs: 7000,
+      samples: 4,
+      trigger: null,
+    };
+    calls.length = 0;
+    mockIPC((command, payload) => {
+      calls.push({ command, payload });
+      return observation;
+    });
+    assert.deepEqual(await observeRegion(region, {
+      operationId: "op",
+      roundId: "round",
+      captureKind: "wait",
+      toolStep: 3,
+      deadlineMs: 20000,
+      probeEnabled: false,
+      markerX: 10,
+      markerY: 20,
+    }), observation);
+    assert.equal(calls[0].command, "observe_region");
+    assert.deepEqual(calls[0].payload, {
+      region,
+      operationId: "op",
+      roundId: "round",
+      captureKind: "wait",
+      toolStep: 3,
+      deadlineMs: 20000,
+      probeEnabled: false,
+      markerX: 10,
+      markerY: 20,
+    });
   } finally {
     clearMocks();
     delete globalThis.window;

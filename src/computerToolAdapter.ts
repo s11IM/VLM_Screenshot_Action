@@ -21,6 +21,7 @@ export type ComputerToolAdapterEvent = {
   coordinateMode?: typeof COMPUTER_TOOL_COORDINATE_MODE;
   sourceCoordinates?: number[][];
   normalizedCoordinates?: number[][];
+  ignoredDuration?: unknown;
 };
 
 type AdaptedCall = {
@@ -162,15 +163,16 @@ const adaptComputerCall = (
         return adaptedCall(call, action, "wait", {
           analysis: adapterAnalysis(action, "wait"),
           name: "Refresh current frame",
-          seconds: 1,
         });
       case "wait": {
-        const duration = finiteNumber(args.duration ?? 1, "computer.duration");
-        return adaptedCall(call, action, "wait", {
+        const adapted = adaptedCall(call, action, "wait", {
           analysis: adapterAnalysis(action, "wait"),
           name: "Wait for current frame",
-          seconds: Math.min(60, Math.max(1, Math.ceil(duration))),
         });
+        if (args.duration !== undefined) {
+          adapted.event.ignoredDuration = args.duration;
+        }
+        return adapted;
       }
       case "left_click":
       case "double_click": {
