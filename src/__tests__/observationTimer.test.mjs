@@ -1,8 +1,18 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { observationWindow, pausedObservationRemainder } from "../observationTimer.ts";
+import { observationProbeDelay, observationWindow, pausedObservationRemainder } from "../observationTimer.ts";
 
 const settings = { operationCaptureDelay: 8, earlyProbeEnabled: true };
+
+test("probing is suppressed for four seconds from model action output, not action completion", () => {
+  assert.equal(observationProbeDelay(1000, 1000), 4000);
+  assert.equal(observationProbeDelay(1000, 1750), 3250);
+  assert.equal(observationProbeDelay(1000, 4999), 1);
+  assert.equal(observationProbeDelay(1000, 4999.5), 1);
+  assert.equal(observationProbeDelay(1000, 5000), 0);
+  assert.equal(observationProbeDelay(1000, 6500), 0);
+  assert.equal(observationProbeDelay(6500, 6500), 4000);
+});
 
 test("early wake freezes the remainder and wait resumes it without probing", () => {
   const remaining = pausedObservationRemainder(8000, { outcome: "early_wake", waitedMs: 2820 });

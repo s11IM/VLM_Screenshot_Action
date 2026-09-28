@@ -35,6 +35,7 @@ export async function observeRegion(
     toolStep?: number;
     deadlineMs: number;
     probeEnabled: boolean;
+    probeDelayMs: number;
     markerX?: number;
     markerY?: number;
     markerFromX?: number;

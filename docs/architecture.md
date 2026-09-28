@@ -164,8 +164,12 @@ be undone, and not every capture or delay is instantly interruptible.
 | Full auto capture | After a formal reply, when explicitly enabled (normally fifteen seconds) | New round and operation |
 
 One timer governs the post-action wait, and it is the same setting for every
-tool. While it runs, native sampling compares the region against the frame the
-model last saw; when the screen changes and then holds still, the wait ends
+tool. Early probing pauses for four seconds from receipt of the model's action
+output, counting action execution time toward the cooldown. The original capture
+deadline is not extended, even if it expires during the cooldown, and the pause
+remains cancellable by the UI or F8. After the cooldown, native sampling compares
+the region against the frame the model last saw; when the screen changes and then
+holds still, the wait ends
 early and the new screenshot is returned without spending the rest of the
 budget. A `wait` that follows such an early wake resumes only the unspent
 remainder and does not probe again, so a round cannot extend its own deadline

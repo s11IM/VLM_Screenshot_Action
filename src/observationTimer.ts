@@ -1,5 +1,9 @@
 import type { RegionObservation, Settings } from "./types.ts";
 
+export function observationProbeDelay(actionOutputAtMs: number, nowMs: number): number {
+  return Math.max(0, Math.ceil(4000 - (nowMs - actionOutputAtMs)));
+}
+
 export function observationWindow(
   tool: string,
   remainingMs: number | null,

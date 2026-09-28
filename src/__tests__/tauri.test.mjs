@@ -37,10 +37,11 @@ test("carries the captured frame token into the input command", async () => {
     assert.deepEqual(await observeRegion(region, {
       operationId: "op",
       roundId: "round",
-      captureKind: "wait",
+      captureKind: "operation-result",
       toolStep: 3,
       deadlineMs: 20000,
-      probeEnabled: false,
+      probeEnabled: true,
+      probeDelayMs: 3250,
       markerX: 10,
       markerY: 20,
     }), observation);
@@ -49,10 +50,11 @@ test("carries the captured frame token into the input command", async () => {
       region,
       operationId: "op",
       roundId: "round",
-      captureKind: "wait",
+      captureKind: "operation-result",
       toolStep: 3,
       deadlineMs: 20000,
-      probeEnabled: false,
+      probeEnabled: true,
+      probeDelayMs: 3250,
       markerX: 10,
       markerY: 20,
     });

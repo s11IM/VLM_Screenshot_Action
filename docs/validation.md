@@ -64,6 +64,8 @@ payment page, privileged application, or account with valuable state.
 - [ ] Manual screenshot excludes the app window and displays correctly.
 - [ ] Sending text or an uploaded reference alone does not offer action tools.
 - [ ] A click/hover/drag executes once, then a fresh image is observed.
+- [ ] Early probing stays off for four seconds after model action output; a shorter
+      capture deadline still wins, and stop/F8 interrupts the cooldown.
 - [ ] Disabling tool-result capture prevents the next model iteration after input.
 - [ ] Keyboard input requires a fresh matching frame; switching focus interrupts it.
 - [ ] Holding F8 during a long key hold stops it and releases pressed keys.

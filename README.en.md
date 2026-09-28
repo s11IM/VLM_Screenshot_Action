@@ -76,7 +76,7 @@ flowchart TD
     E --> E2[Remember where it acted and mark that spot with a red dot<br/>typing and key presses get no red dot]
     E2 --> H{Is auto-screenshot after tools on?}
     H -- no, and this step was not a wait --> H2([The round stops; it waits for you to capture by hand])
-    H -- yes --> I[Hide the window first and wait for the screen to change, then settle<br/>capture early once it settles, or at the latest when the time is up]
+    H -- yes --> I[Hide the window; pause early probing for 4 s after model action output<br/>then capture early on change and settle, or when the original time is up]
     I --> J[The new screenshot becomes the starting point of the next cycle]
     J --> C
     R --> K{Is full auto on?}
@@ -92,7 +92,8 @@ Details that the diagram leaves out but the code really does:
 - **One action per turn.** The model sometimes returns several tool calls at once; only the first is executed and the rest are dropped.
 - **Three steps in a row that cannot run end the round by themselves.** Steps that could not execute (tools off, no usable frame, invalid arguments, an error while running) add up; a single success in between clears the count, so ordinary runs are never cut short. Before this guard existed, a model that kept returning calls that could not run would loop forever (`toolFailureGuard.ts`).
 - **Failed steps do not consume the wait.** A step that was not executed or failed never starts the wait timer; the app grabs a fresh screenshot right away and asks the model again (`App.tsx:959-979`). Only an action that truly ran goes on to "wait for the screen to settle", and only that successful path clears the remainder left over from an early wake (`App.tsx:834-835`).
-- **A `wait` after an early wake resumes from the pause point.** If the screen changes and then settles during the wait, the model is woken early and the remaining time is stored; if it then picks `wait`, that remaining time is used to keep waiting (with no further probing), while any other action restarts the full timer (`observationTimer.ts:3`).
+- **A `wait` after an early wake resumes from the pause point.** If the screen changes and then settles during the wait, the model is woken early and the remaining time is stored; if it then picks `wait`, that remaining time is used to keep waiting (with no further probing), while any other action restarts the full timer (`observationTimer.ts`).
+- **Action output starts a 4-second probe cooldown.** It starts when the model action response is received, including action execution time. Early-wake probing pauses during it; the original capture deadline is not extended, and stop/F8 still work. A resumed `wait` after an early wake still does not probe.
 - **Turning off early probing** falls back to a plain timer: sleep the configured time and take one screenshot, with no early wake.
 - **A brand-new round needs a screenshot of its own before the model gets any tools.** Only three attachment sources count as an actionable frame: manual capture, full auto, and the capture taken after a tool ran; an image you upload from a file is reference only and never counts (`model.ts:248-253`). So a first round where you only selected a region and typed a message offers no tools at all and the model can only reply with text; the tools appear once a later round carries a capture.
 - **A failed request is retried once** (3 s apart by default), with the request timeout configurable (60 s by default).

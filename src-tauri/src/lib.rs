@@ -1108,6 +1108,12 @@ fn clamp_deadline_ms(deadline_ms: u64) -> u64 {
     deadline_ms.min(120_000)
 }
 
+fn remaining_probe_delay(deadline: Duration, probe_delay_ms: u64, elapsed: Duration) -> Duration {
+    Duration::from_millis(probe_delay_ms)
+        .min(deadline)
+        .saturating_sub(elapsed)
+}
+
 fn next_interval(
     current: u64,
     sample_cost_ms: u64,
@@ -1197,12 +1203,20 @@ fn run_observation(
     region: Region,
     deadline: Duration,
     probe_enabled: bool,
+    probe_delay_ms: u64,
     stored_baseline: Option<desktop::observe::GrayImage>,
     cancelled: Arc<AtomicBool>,
     started: Instant,
 ) -> Result<ObservationCapture, String> {
     let params = desktop::observe::ObserveParams::default();
-    if !probe_enabled {
+    if probe_enabled {
+        // Do not sample during the cooldown or extend the original capture deadline.
+        interruptible_sleep(
+            remaining_probe_delay(deadline, probe_delay_ms, started.elapsed()),
+            &cancelled,
+        )?;
+    }
+    if !probe_enabled || started.elapsed() >= deadline {
         interruptible_sleep(deadline.saturating_sub(started.elapsed()), &cancelled)?;
         let foreground_before = desktop::foreground_window();
         let image = desktop::capture_region(region)?;
@@ -1338,6 +1352,7 @@ async fn observe_region(
     tool_step: Option<u32>,
     deadline_ms: u64,
     probe_enabled: bool,
+    probe_delay_ms: u64,
     marker_x: Option<i32>,
     marker_y: Option<i32>,
     marker_from_x: Option<i32>,
@@ -1354,6 +1369,7 @@ async fn observe_region(
         "toolStep": tool_step,
         "deadlineMs": deadline_ms,
         "probeEnabled": probe_enabled,
+        "probeDelayMs": probe_delay_ms,
         "region": region_metadata(region),
     });
     log_event("info", "observation.started", log_context);
@@ -1455,6 +1471,7 @@ async fn observe_region(
             region,
             Duration::from_millis(deadline),
             probe_enabled,
+            probe_delay_ms,
             stored_baseline,
             cancelled,
             started,
@@ -2464,6 +2481,42 @@ mod tests {
         assert_eq!(clamp_deadline_ms(20_000), 20_000);
         assert_eq!(clamp_deadline_ms(120_000), 120_000);
         assert_eq!(clamp_deadline_ms(120_001), 120_000);
+    }
+
+    #[test]
+    fn probe_delay_preserves_deadline_and_counts_setup_time() {
+        for (deadline_ms, delay_ms, elapsed_ms, expected_ms) in [
+            (8000, 4000, 0, 4000),
+            (8000, 3500, 200, 3300),
+            (2000, 4000, 200, 1800),
+            (8000, 4000, 4000, 0),
+            (8000, 4000, 5000, 0),
+            (8000, 0, 200, 0),
+            (0, 4000, 0, 0),
+        ] {
+            assert_eq!(
+                remaining_probe_delay(
+                    Duration::from_millis(deadline_ms),
+                    delay_ms,
+                    Duration::from_millis(elapsed_ms),
+                ),
+                Duration::from_millis(expected_ms),
+            );
+        }
+    }
+
+    #[test]
+    fn observation_cooldown_honors_cancellation_before_capture() {
+        let result = run_observation(
+            captured_frame().region,
+            Duration::from_secs(8),
+            true,
+            4000,
+            None,
+            Arc::new(AtomicBool::new(true)),
+            Instant::now(),
+        );
+        assert_eq!(result.err().as_deref(), Some("本轮操作已取消"));
     }
 
     #[test]

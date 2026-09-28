@@ -39,7 +39,7 @@ import {
   parseToolArguments,
 } from "./model";
 import { adaptUnexpectedComputerToolCalls } from "./computerToolAdapter";
-import { observationWindow, pausedObservationRemainder } from "./observationTimer";
+import { observationProbeDelay, observationWindow, pausedObservationRemainder } from "./observationTimer";
 import {
   nextToolFailureStreak,
   toolFailureLimitReached,
@@ -704,6 +704,7 @@ function App() {
         requestIndex,
         requestTools,
       );
+      const actionOutputAt = performance.now();
       const assistant = response.choices?.[0]?.message;
       if (!assistant) {
         throw new Error(response.error?.message || "模型没有返回有效消息");
@@ -980,6 +981,9 @@ function App() {
             toolStep: toolCallCount,
             deadlineMs: observeDeadlineMs,
             probeEnabled: observeProbeEnabled,
+            probeDelayMs: observeProbeEnabled
+              ? observationProbeDelay(actionOutputAt, performance.now())
+              : 0,
             markerX: lastActionMarker?.x,
             markerY: lastActionMarker?.y,
             markerFromX: lastActionMarker?.fromX,
