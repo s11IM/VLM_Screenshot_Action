@@ -233,6 +233,11 @@ fn hide_window_for_background_action(window: &WebviewWindow) -> Result<WindowPre
     };
     if presentation.hidden_for_action {
         window.hide().map_err(|error| error.to_string())?;
+        log_event(
+            "debug",
+            "window.hidden",
+            json!({ "restoreFocus": presentation.focused }),
+        );
     }
     Ok(presentation)
 }
@@ -240,7 +245,6 @@ fn hide_window_for_background_action(window: &WebviewWindow) -> Result<WindowPre
 fn restore_window_after_background_action(
     window: &WebviewWindow,
     presentation: WindowPresentation,
-    restore_focus: bool,
 ) {
     if !presentation.hidden_for_action {
         return;
@@ -253,11 +257,6 @@ fn restore_window_after_background_action(
         );
         return;
     }
-    log_event(
-        "debug",
-        "window.restored",
-        json!({ "restoreFocus": restore_focus }),
-    );
     if presentation.maximized {
         let _ = window.maximize();
     } else {
@@ -268,9 +267,33 @@ fn restore_window_after_background_action(
     }
     if presentation.minimized {
         let _ = window.minimize();
-    } else if restore_focus && presentation.focused {
-        let _ = window.set_focus();
+    } else if presentation.focused {
+        if let Err(error) = window.set_focus() {
+            log_event(
+                "warn",
+                "window.focus_failed",
+                json!({ "error": error.to_string() }),
+            );
+        }
+        // show() alone can leave the app behind the window exposed by hide().
+        #[cfg(windows)]
+        if let Err(error) = window
+            .hwnd()
+            .map_err(|error| error.to_string())
+            .and_then(|hwnd| desktop::raise_restored_window(hwnd.0 as usize))
+        {
+            log_event("warn", "window.raise_failed", json!({ "error": error }));
+        }
     }
+    log_event(
+        "debug",
+        "window.restored",
+        json!({
+            "restoreFocus": presentation.focused,
+            "visible": window.is_visible().ok(),
+            "focused": window.is_focused().ok(),
+        }),
+    );
 }
 
 // Use the same cleanup on completion, error, and dropped command futures.
@@ -701,7 +724,7 @@ async fn select_region(
         if let Ok(mut context) = state.context.lock() {
             *context = None;
         }
-        restore_window_after_background_action(&window, presentation, true);
+        restore_window_after_background_action(&window, presentation);
     });
     tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1026,7 +1049,7 @@ async fn capture_region(
     }
     let presentation = hide_window_for_background_action(&window)?;
     let restore_guard = WindowRestoreGuard::new(move || {
-        restore_window_after_background_action(&window, presentation, false);
+        restore_window_after_background_action(&window, presentation);
     });
     if presentation.hidden_for_action {
         tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
@@ -1105,10 +1128,20 @@ fn clamp_deadline_ms(deadline_ms: u64) -> u64 {
     deadline_ms.min(120_000)
 }
 
-fn remaining_probe_delay(deadline: Duration, probe_delay_ms: u64, elapsed: Duration) -> Duration {
-    Duration::from_millis(probe_delay_ms)
-        .min(deadline)
-        .saturating_sub(elapsed)
+fn observation_sample_wait(
+    interval: Duration,
+    sample_cost: Duration,
+    elapsed: Duration,
+    unlock_at: Duration,
+    deadline: Duration,
+) -> Duration {
+    let mut wait = interval
+        .saturating_sub(sample_cost)
+        .min(deadline.saturating_sub(elapsed));
+    if elapsed < unlock_at {
+        wait = wait.min(unlock_at - elapsed);
+    }
+    wait
 }
 
 fn next_interval(
@@ -1172,12 +1205,14 @@ fn draw_region_markers(
     let (Some(mx), Some(my)) = (marker_x, marker_y) else {
         return;
     };
-    let cx = ((region.width.saturating_sub(1) as f64) * mx as f64 / 1000.0).round() as i32;
-    let cy = ((region.height.saturating_sub(1) as f64) * my as f64 / 1000.0).round() as i32;
+    let image_region = Region {
+        x: 0,
+        y: 0,
+        ..region
+    };
+    let (cx, cy) = screen_point(image_region, mx, my);
     if let (Some(fx), Some(fy)) = (marker_from_x, marker_from_y) {
-        let start_x = ((region.width.saturating_sub(1) as f64) * fx as f64 / 1000.0).round() as i32;
-        let start_y =
-            ((region.height.saturating_sub(1) as f64) * fy as f64 / 1000.0).round() as i32;
+        let (start_x, start_y) = screen_point(image_region, fx, fy);
         draw_drag_trail(image, start_x, start_y, cx, cy);
     } else {
         draw_crosshair(image, cx, cy);
@@ -1206,13 +1241,7 @@ fn run_observation(
     started: Instant,
 ) -> Result<ObservationResult, String> {
     let params = desktop::observe::ObserveParams::default();
-    if probe_enabled {
-        // Do not sample during the cooldown or extend the original capture deadline.
-        interruptible_sleep(
-            remaining_probe_delay(deadline, probe_delay_ms, started.elapsed()),
-            &cancelled,
-        )?;
-    }
+    check_observation_cancelled(&cancelled)?;
     if !probe_enabled || started.elapsed() >= deadline {
         interruptible_sleep(deadline.saturating_sub(started.elapsed()), &cancelled)?;
         return Ok(ObservationResult {
@@ -1247,34 +1276,44 @@ fn run_observation(
         }
 
         let sample_started = Instant::now();
+        let sampled_at_ms = elapsed_ms(started);
         let image = desktop::capture_region(region)?;
         let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
-        let sample_outcome = detector.on_sample(&thumb);
+        let now_ms = elapsed_ms(started);
+        let sample_outcome = detector.on_sample(&thumb, sampled_at_ms, probe_delay_ms);
         let sample_cost_ms =
             u64::try_from(sample_started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let now_ms = elapsed_ms(started);
         sample_elapsed.push(now_ms);
         let metrics = &sample_outcome.metrics;
-        if !(metrics.state == "armed"
-            && metrics.changed_fraction == 0.0
-            && metrics.motion_fraction == 0.0)
-        {
-            log_event(
-                "debug",
-                "observation.sample",
-                json!({
-                    "index": metrics.index,
-                    "changedFraction": metrics.changed_fraction,
-                    "motionFraction": metrics.motion_fraction,
-                    "topDecileMean": metrics.top_decile_mean,
-                    "globalMeanShift": metrics.global_mean_shift,
-                    "state": metrics.state,
-                    "sampleCostMs": sample_cost_ms,
-                    "elapsedMs": now_ms,
-                    "intervalMs": interval,
-                }),
-            );
-        }
+        log_event(
+            "debug",
+            "observation.sample",
+            json!({
+                "index": metrics.index,
+                "changedFraction": metrics.changed_fraction,
+                "motionFraction": metrics.motion_fraction,
+                "topDecileMean": metrics.top_decile_mean,
+                "globalMeanShift": metrics.global_mean_shift,
+                "windowMean": metrics.window_mean,
+                "windowPeak": metrics.window_peak,
+                "noiseMean": metrics.noise_mean,
+                "noisePeak": metrics.noise_peak,
+                "noiseFraction": metrics.noise_fraction,
+                "meanLimit": metrics.mean_limit,
+                "peakLimit": metrics.peak_limit,
+                "fractionLimit": metrics.fraction_limit,
+                "calibrated": metrics.calibrated,
+                "noiseUpdated": metrics.noise_updated,
+                "quietestScore": metrics.quietest_score,
+                "stableForMs": metrics.stable_for_ms,
+                "sampleKind": "local-probe",
+                "state": metrics.state,
+                "sampleCostMs": sample_cost_ms,
+                "elapsedMs": now_ms,
+                "sampledAtMs": sampled_at_ms,
+                "intervalMs": interval,
+            }),
+        );
         check_observation_cancelled(&cancelled)?;
         let deadline_reached = started.elapsed() >= deadline;
         if sample_outcome.triggered || deadline_reached {
@@ -1298,8 +1337,16 @@ fn run_observation(
             });
         }
         interval = next_interval(interval, sample_cost_ms, detector.params());
-        let remaining = deadline.saturating_sub(started.elapsed());
-        interruptible_sleep(Duration::from_millis(interval).min(remaining), &cancelled)?;
+        interruptible_sleep(
+            observation_sample_wait(
+                Duration::from_millis(interval),
+                sample_started.elapsed(),
+                started.elapsed(),
+                Duration::from_millis(probe_delay_ms),
+                deadline,
+            ),
+            &cancelled,
+        )?;
     }
 }
 
@@ -1331,6 +1378,8 @@ async fn observe_region(
         "deadlineMs": deadline_ms,
         "probeEnabled": probe_enabled,
         "probeDelayMs": probe_delay_ms,
+        "detector": "adaptive-window-v4",
+        "settleDurationMs": desktop::observe::ObserveParams::default().settle_duration_ms,
         "region": region_metadata(region),
     });
     log_event("info", "observation.started", log_context);
@@ -1427,6 +1476,8 @@ async fn observe_region(
     let keep_visible = !probe_enabled || exclusion.is_some();
     #[cfg(not(windows))]
     let keep_visible = !probe_enabled;
+    #[cfg(not(windows))]
+    let exclusion = ();
 
     log_event(
         "debug",
@@ -1443,7 +1494,7 @@ async fn observe_region(
         let presentation = hide_window_for_background_action(&window)?;
         let sampling_window = window.clone();
         let guard = WindowRestoreGuard::new(move || {
-            restore_window_after_background_action(&sampling_window, presentation, false);
+            restore_window_after_background_action(&sampling_window, presentation);
         });
         if presentation.hidden_for_action {
             tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
@@ -1452,10 +1503,8 @@ async fn observe_region(
     };
     let sampling_cancelled = Arc::clone(&cancelled);
     let loop_result = tauri::async_runtime::spawn_blocking(move || {
-        // Keep exclusion/fallback alive even if the awaiting command future is dropped.
-        #[cfg(windows)]
-        let _exclusion = exclusion;
-        let _sampling_restore = sampling_restore;
+        // On success, transfer cleanup to final capture without a show/hide cycle.
+        // On error or a dropped receiver, the worker still drops both guards.
         run_observation(
             region,
             Duration::from_millis(deadline),
@@ -1465,11 +1514,12 @@ async fn observe_region(
             sampling_cancelled,
             started,
         )
+        .map(|observed| (observed, exclusion, sampling_restore))
     })
     .await
     .map_err(|error| error.to_string());
-    let observed = match loop_result {
-        Ok(Ok(observed)) => observed,
+    let (observed, _exclusion, sampling_restore) = match loop_result {
+        Ok(Ok(result)) => result,
         Ok(Err(error)) | Err(error) => {
             log_event(
                 "error",
@@ -1488,10 +1538,18 @@ async fn observe_region(
         }
     };
     // Probe frames are never used as model screenshots or keyboard focus tokens.
+    log_event(
+        "info",
+        "observation.capture_started",
+        json!({
+            "operationId": operation_id, "roundId": round_id, "toolStep": tool_step,
+            "outcome": observed.outcome, "waitedMs": observed.waited_ms,
+        }),
+    );
     check_observation_cancelled(&cancelled)?;
     let presentation = hide_window_for_background_action(&window)?;
     let restore_guard = WindowRestoreGuard::new(move || {
-        restore_window_after_background_action(&window, presentation, false);
+        restore_window_after_background_action(&window, presentation);
     });
     if presentation.hidden_for_action {
         tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
@@ -1511,6 +1569,7 @@ async fn observe_region(
         desktop::observe::ObserveParams::default().long_edge,
     );
     restore_guard.restore();
+    drop(sampling_restore);
     draw_region_markers(
         &mut image,
         region,
@@ -1657,7 +1716,7 @@ async fn execute_input_action(
     }
     let presentation = hide_window_for_background_action(&window)?;
     let restore_guard = WindowRestoreGuard::new(move || {
-        restore_window_after_background_action(&window, presentation, false);
+        restore_window_after_background_action(&window, presentation);
     });
     if presentation.hidden_for_action {
         tokio::time::sleep(Duration::from_millis(120)).await;
@@ -1706,7 +1765,12 @@ async fn execute_input_action(
                 let y = normalized_coordinate(action.y, "y")?;
                 let (px, py) = screen_point(region, x, y);
                 let clicks = action.clicks.unwrap_or(1);
+                log_event("debug", "input.pointer_target", json!({
+                    "kind": "click", "screenStart": [px, py], "holdMs": 60,
+                    "effectVerified": false,
+                }));
                 desktop::click(&mut enigo, (px, py), Button::Left, clicks, &is_cancelled)?;
+                log_event("debug", "input.pointer_completed", json!({ "kind": "click", "actual": enigo.location().ok() }));
             }
             "drag" => {
                 let from_x = normalized_coordinate(action.from_x, "fromX")?;
@@ -1716,6 +1780,11 @@ async fn execute_input_action(
                 let duration = 500_u64;
                 let (start_x, start_y) = screen_point(region, from_x, from_y);
                 let (end_x, end_y) = screen_point(region, to_x, to_y);
+                log_event("debug", "input.pointer_target", json!({
+                    "kind": "drag", "screenStart": [start_x, start_y], "screenEnd": [end_x, end_y],
+                    "moveMs": duration, "hoverMs": 100, "pickupMs": 100, "dropMs": 80,
+                    "effectVerified": false,
+                }));
                 desktop::drag(
                     &mut enigo,
                     (start_x, start_y),
@@ -1724,6 +1793,7 @@ async fn execute_input_action(
                     duration,
                     &is_cancelled,
                 )?;
+                log_event("debug", "input.pointer_completed", json!({ "kind": "drag", "actual": enigo.location().ok() }));
             }
             "hover" => {
                 let x = normalized_coordinate(action.x, "x")?;
@@ -2266,6 +2336,26 @@ mod tests {
         assert_eq!(calls.get(), 1);
     }
 
+    #[test]
+    fn sampling_cleanup_transfers_to_capture_and_survives_worker_failure() {
+        use std::sync::atomic::AtomicUsize;
+        for succeeds in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let result = thread::spawn(move || {
+                let guard = WindowRestoreGuard::new(move || {
+                    counted.fetch_add(1, Ordering::SeqCst);
+                });
+                succeeds.then_some(()).ok_or("cancelled").map(|_| guard)
+            })
+            .join()
+            .unwrap();
+            assert_eq!(calls.load(Ordering::SeqCst), usize::from(!succeeds));
+            drop(result);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
     fn captured_frame() -> CapturedFrame {
         CapturedFrame {
             id: "current-frame".into(),
@@ -2355,6 +2445,34 @@ mod tests {
         let value = serde_json::to_value(image).unwrap();
         assert_eq!(value["frameId"], "id");
         assert_eq!(value["dataUrl"], "data:image/png;base64,test");
+    }
+
+    #[test]
+    fn drag_markers_use_the_same_pixels_as_input_for_reported_region() {
+        let region = Region {
+            x: 143,
+            y: 103,
+            width: 1637,
+            height: 922,
+        };
+        let mut image = xcap::image::RgbaImage::new(region.width, region.height);
+        draw_region_markers(
+            &mut image,
+            region,
+            Some(500),
+            Some(650),
+            Some(795),
+            Some(920),
+        );
+        for (x, y) in [(795, 920), (500, 650)] {
+            let (screen_x, screen_y) = screen_point(region, x, y);
+            assert_eq!(
+                image
+                    .get_pixel((screen_x - region.x) as u32, (screen_y - region.y) as u32)
+                    .0,
+                [255, 45, 45, 255]
+            );
+        }
     }
 
     #[test]
@@ -2493,23 +2611,24 @@ mod tests {
     }
 
     #[test]
-    fn probe_delay_preserves_deadline_and_counts_setup_time() {
-        for (deadline_ms, delay_ms, elapsed_ms, expected_ms) in [
-            (8000, 4000, 0, 4000),
-            (8000, 3500, 200, 3300),
-            (2000, 4000, 200, 1800),
-            (8000, 4000, 4000, 0),
-            (8000, 4000, 5000, 0),
-            (8000, 0, 200, 0),
-            (0, 4000, 0, 0),
+    fn sample_cadence_counts_capture_cost_and_honors_unlock_and_deadline() {
+        for (cost, elapsed, unlock, deadline, expected) in [
+            (60, 60, 4000, 8000, 540),
+            (60, 3950, 4000, 8000, 50),
+            (60, 7990, 4000, 8000, 10),
+            (700, 700, 4000, 8000, 0),
+            (60, 2000, 4000, 2000, 0),
+            (60, 0, 0, 0, 0),
         ] {
             assert_eq!(
-                remaining_probe_delay(
-                    Duration::from_millis(deadline_ms),
-                    delay_ms,
-                    Duration::from_millis(elapsed_ms),
+                observation_sample_wait(
+                    Duration::from_millis(600),
+                    Duration::from_millis(cost),
+                    Duration::from_millis(elapsed),
+                    Duration::from_millis(unlock),
+                    Duration::from_millis(deadline),
                 ),
-                Duration::from_millis(expected_ms),
+                Duration::from_millis(expected),
             );
         }
     }
@@ -2582,13 +2701,13 @@ mod tests {
         );
         assert_eq!(
             next_interval(250, params.sample_cost_threshold_ms + 1, &params),
-            700
+            600
         );
         assert_eq!(
-            next_interval(700, params.sample_cost_threshold_ms + 1, &params),
-            700
+            next_interval(600, params.sample_cost_threshold_ms + 1, &params),
+            600
         );
-        assert_eq!(next_interval(700, 0, &params), 700);
+        assert_eq!(next_interval(600, 0, &params), 600);
     }
 
     #[test]

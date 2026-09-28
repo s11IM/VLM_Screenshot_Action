@@ -165,6 +165,32 @@ pub fn foreground_window() -> usize {
     }
 }
 
+#[cfg(windows)]
+pub fn raise_restored_window(window: usize) -> Result<()> {
+    use windows::Win32::{
+        Foundation::HWND,
+        UI::WindowsAndMessaging::{
+            SetForegroundWindow, SetWindowPos, HWND_TOP, SWP_NOMOVE, SWP_NOSIZE, SWP_SHOWWINDOW,
+        },
+    };
+    unsafe {
+        let hwnd = HWND(window as *mut std::ffi::c_void);
+        // Raise without permanently making the app topmost, even if Windows denies activation.
+        SetWindowPos(
+            hwnd,
+            Some(HWND_TOP),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        )
+        .map_err(|error| error.to_string())?;
+        let _ = SetForegroundWindow(hwnd);
+    }
+    Ok(())
+}
+
 pub fn keyboard_emergency_stop_pressed() -> bool {
     #[cfg(windows)]
     unsafe {
@@ -229,6 +255,33 @@ pub fn new_input() -> Result<Enigo> {
     Enigo::new(&Settings::default()).map_err(|e| e.to_string())
 }
 
+fn verify_pointer(enigo: &impl Mouse, expected: (i32, i32)) -> Result<()> {
+    let actual = enigo.location().map_err(|error| error.to_string())?;
+    if (actual.0 as i64 - expected.0 as i64).abs() > 2
+        || (actual.1 as i64 - expected.1 as i64).abs() > 2
+    {
+        return Err(format!(
+            "Mouse position mismatch: expected {expected:?}, actual {actual:?}"
+        ));
+    }
+    Ok(())
+}
+
+fn with_mouse_button<T: Mouse>(
+    input: &mut T,
+    button: Button,
+    action: impl FnOnce(&mut T) -> Result<()>,
+) -> Result<()> {
+    input
+        .button(button, Press)
+        .map_err(|error| error.to_string())?;
+    let result = action(input);
+    let release = input
+        .button(button, Release)
+        .map_err(|error| error.to_string());
+    result.and(release)
+}
+
 pub fn click(
     enigo: &mut Enigo,
     point: (i32, i32),
@@ -236,15 +289,45 @@ pub fn click(
     clicks: u8,
     cancelled: &impl Fn() -> bool,
 ) -> Result<()> {
+    click_with_move(enigo, point, button, clicks, cancelled, move_mouse)
+}
+
+fn click_with_move<T: Mouse>(
+    input: &mut T,
+    point: (i32, i32),
+    button: Button,
+    clicks: u8,
+    cancelled: &impl Fn() -> bool,
+    mut move_to: impl FnMut(&mut T, i32, i32) -> Result<()>,
+) -> Result<()> {
     if !(1..=2).contains(&clicks) {
         return Err("clicks must be 1 or 2".into());
     }
     check_cancel(cancelled)?;
-    move_mouse(enigo, point.0, point.1)?;
+    move_to(input, point.0, point.1)?;
     wait(70, cancelled)?;
+    let mut repositioned = false;
     for index in 0..clicks {
         check_cancel(cancelled)?;
-        enigo.button(button, Click).map_err(|e| e.to_string())?;
+        let actual = input.location().map_err(|error| error.to_string())?;
+        if (actual.0 as i64 - point.0 as i64).abs() > 2
+            || (actual.1 as i64 - point.1 as i64).abs() > 2
+        {
+            if repositioned {
+                return Err(format!(
+                    "Mouse position mismatch: expected {point:?}, actual {actual:?}"
+                ));
+            }
+            // Correct one transient displacement before pressing, never replay sent clicks.
+            check_cancel(cancelled)?;
+            repositioned = true;
+            move_to(input, point.0, point.1)?;
+            wait(70, cancelled)?;
+            verify_pointer(input, point)?;
+        }
+        check_cancel(cancelled)?;
+        // Frame-polled games can miss a down/up pair dispatched in a single tick.
+        with_mouse_button(input, button, |_| wait(60, cancelled))?;
         if index + 1 < clicks {
             wait(90, cancelled)?;
         }
@@ -265,8 +348,11 @@ pub fn drag(
     }
     check_cancel(cancelled)?;
     move_mouse(enigo, from.0, from.1)?;
-    enigo.button(button, Press).map_err(|e| e.to_string())?;
-    let result = (|| {
+    wait(100, cancelled)?;
+    verify_pointer(enigo, from)?;
+    with_mouse_button(enigo, button, |enigo| {
+        // Allow hover hit-testing and pickup to run before the first drag movement.
+        wait(100, cancelled)?;
         let start = Instant::now();
         while start.elapsed().as_millis() < duration_ms as u128 {
             check_cancel(cancelled)?;
@@ -279,10 +365,10 @@ pub fn drag(
             wait(12, cancelled)?;
         }
         check_cancel(cancelled)?;
-        move_mouse(enigo, to.0, to.1)
-    })();
-    let release = enigo.button(button, Release).map_err(|e| e.to_string());
-    result.and(release)
+        move_mouse(enigo, to.0, to.1)?;
+        wait(80, cancelled)?;
+        verify_pointer(enigo, to)
+    })
 }
 
 pub fn parse_key(name: &str) -> Result<Key> {
@@ -377,6 +463,189 @@ mod tests {
     use std::cell::Cell;
 
     #[derive(Default)]
+    struct RecordingMouse {
+        buttons: Vec<(Button, enigo::Direction)>,
+        position: (i32, i32),
+        drift_on_release: bool,
+    }
+
+    impl Mouse for RecordingMouse {
+        fn button(
+            &mut self,
+            button: Button,
+            direction: enigo::Direction,
+        ) -> enigo::InputResult<()> {
+            self.buttons.push((button, direction));
+            if direction == Release && self.drift_on_release {
+                self.position.0 += 10;
+            }
+            Ok(())
+        }
+        fn move_mouse(&mut self, _: i32, _: i32, _: enigo::Coordinate) -> enigo::InputResult<()> {
+            unreachable!()
+        }
+        fn scroll(&mut self, _: i32, _: enigo::Axis) -> enigo::InputResult<()> {
+            unreachable!()
+        }
+        fn main_display(&self) -> enigo::InputResult<(i32, i32)> {
+            unreachable!()
+        }
+        fn location(&self) -> enigo::InputResult<(i32, i32)> {
+            Ok(self.position)
+        }
+    }
+
+    #[test]
+    fn click_repositions_once_without_replaying_a_sent_click() {
+        for drift_on_release in [false, true] {
+            let mut input = RecordingMouse {
+                drift_on_release,
+                ..Default::default()
+            };
+            let mut moves = 0;
+            click_with_move(
+                &mut input,
+                (100, 200),
+                Button::Left,
+                2,
+                &|| false,
+                |input, x, y| {
+                    moves += 1;
+                    input.position = if moves == 1 && !drift_on_release {
+                        (x + 10, y)
+                    } else {
+                        (x, y)
+                    };
+                    Ok(())
+                },
+            )
+            .unwrap();
+            assert_eq!(moves, 2);
+            assert_eq!(
+                input.buttons,
+                vec![
+                    (Button::Left, Press),
+                    (Button::Left, Release),
+                    (Button::Left, Press),
+                    (Button::Left, Release)
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn click_keeps_tolerance_and_does_not_reposition_when_aligned() {
+        let mut input = RecordingMouse::default();
+        let mut moves = 0;
+        click_with_move(
+            &mut input,
+            (100, 200),
+            Button::Left,
+            2,
+            &|| false,
+            |input, x, y| {
+                moves += 1;
+                input.position = (x + 2, y - 2);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(moves, 1);
+        assert_eq!(input.buttons.len(), 4);
+    }
+
+    #[test]
+    fn click_stops_on_persistent_or_repeated_displacement() {
+        for recover_first in [false, true] {
+            let mut input = RecordingMouse {
+                drift_on_release: recover_first,
+                ..Default::default()
+            };
+            let mut moves = 0;
+            let result = click_with_move(
+                &mut input,
+                (100, 200),
+                Button::Left,
+                2,
+                &|| false,
+                |input, x, y| {
+                    moves += 1;
+                    input.position = if moves == 2 && recover_first {
+                        (x, y)
+                    } else {
+                        (x + 10, y)
+                    };
+                    Ok(())
+                },
+            );
+            assert!(result.unwrap_err().starts_with("Mouse position mismatch"));
+            assert_eq!(moves, 2);
+            assert_eq!(input.buttons.len(), if recover_first { 2 } else { 0 });
+        }
+    }
+
+    #[test]
+    fn click_reposition_honors_cancellation_and_move_errors() {
+        for cancel in [false, true] {
+            let mut input = RecordingMouse::default();
+            let stopped = Cell::new(false);
+            let mut moves = 0;
+            let result = click_with_move(
+                &mut input,
+                (100, 200),
+                Button::Left,
+                1,
+                &|| stopped.get(),
+                |input, x, y| {
+                    moves += 1;
+                    input.position = (x + 10, y);
+                    if moves == 2 {
+                        if !cancel {
+                            return Err("move failed".into());
+                        }
+                        stopped.set(true);
+                    }
+                    Ok(())
+                },
+            );
+            assert!(result.is_err());
+            assert_eq!(moves, 2);
+            assert!(input.buttons.is_empty());
+        }
+        let mut input = RecordingMouse::default();
+        assert!(click_with_move(
+            &mut input,
+            (100, 200),
+            Button::Left,
+            1,
+            &|| true,
+            |_, _, _| { panic!("cancelled click must not move the pointer") }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn mouse_button_is_held_then_released_on_success_error_and_cancellation() {
+        for fails in [false, true] {
+            let mut input = RecordingMouse::default();
+            let result = with_mouse_button(&mut input, Button::Left, |input| {
+                assert_eq!(input.buttons, vec![(Button::Left, Press)]);
+                wait(0, &|| fails)
+            });
+            assert_eq!(result.is_err(), fails);
+            assert_eq!(
+                input.buttons,
+                vec![(Button::Left, Press), (Button::Left, Release)]
+            );
+        }
+        let mut input = RecordingMouse::default();
+        assert!(
+            with_mouse_button(&mut input, Button::Left, |_| Err("move failed".into())).is_err()
+        );
+        assert_eq!(input.buttons.last(), Some(&(Button::Left, Release)));
+    }
+
+    #[derive(Default)]
     struct RecordingKeyboard {
         keys: Vec<(Key, enigo::Direction)>,
         text: String,
@@ -465,6 +734,68 @@ mod tests {
 
     #[test]
     #[cfg(windows)]
+    #[ignore = "requires an interactive Windows desktop; briefly raises test windows"]
+    fn restored_window_returns_above_target_without_becoming_topmost() {
+        use windows::{
+            core::w,
+            Win32::{Foundation::HWND, UI::WindowsAndMessaging::*},
+        };
+        struct Windows(Vec<HWND>, HWND);
+        impl Drop for Windows {
+            fn drop(&mut self) {
+                unsafe {
+                    for hwnd in &self.0 {
+                        let _ = DestroyWindow(*hwnd);
+                    }
+                    let _ = SetForegroundWindow(self.1);
+                }
+            }
+        }
+        unsafe {
+            let mut windows = Windows(Vec::new(), GetForegroundWindow());
+            for _ in 0..2 {
+                let hwnd = CreateWindowExW(
+                    WS_EX_TOOLWINDOW,
+                    w!("STATIC"),
+                    w!("Window restoration test"),
+                    WS_POPUP,
+                    96,
+                    96,
+                    240,
+                    160,
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+                windows.0.push(hwnd);
+                let _ = ShowWindow(hwnd, SW_SHOWNOACTIVATE);
+            }
+            let app = windows.0[0];
+            let target = windows.0[1];
+            for _ in 0..3 {
+                let _ = ShowWindow(app, SW_HIDE);
+                assert!(!IsWindowVisible(app).as_bool());
+                SetWindowPos(target, Some(HWND_TOP), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE).unwrap();
+                raise_restored_window(app.0 as usize).unwrap();
+                assert!(IsWindowVisible(app).as_bool());
+                assert!(!IsIconic(app).as_bool());
+                assert_eq!(GetWindowLongW(app, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST.0, 0);
+                let mut below = GetWindow(app, GW_HWNDNEXT).unwrap();
+                while below != target && !below.is_invalid() {
+                    below = GetWindow(below, GW_HWNDNEXT).unwrap_or_default();
+                }
+                assert_eq!(
+                    below, target,
+                    "restored app must be above the exposed target"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
     #[ignore = "requires an interactive Windows desktop; briefly shows test windows"]
     fn capture_exclusion_keeps_window_visible_but_samples_underneath() {
         use windows::{
@@ -543,7 +874,7 @@ mod tests {
                 observe::ObserveParams::default(),
                 observe::downscale_gray(&clean, 160),
             );
-            for offset in [0, 10, 20, 0, 10, 20, 0, 10] {
+            for (index, offset) in [0, 10, 20, 0, 10, 20, 0, 10].into_iter().enumerate() {
                 SetWindowPos(
                     overlay.0,
                     Some(HWND_TOPMOST),
@@ -555,7 +886,11 @@ mod tests {
                 )
                 .unwrap();
                 let image = sample();
-                let out = detector.on_sample(&observe::downscale_gray(&image, 160));
+                let out = detector.on_sample(
+                    &observe::downscale_gray(&image, 160),
+                    index as u64 * 600,
+                    0,
+                );
                 assert_eq!(out.metrics.changed_fraction, 0.0);
                 assert_eq!(out.metrics.motion_fraction, 0.0);
                 assert!(!out.triggered);
@@ -574,9 +909,9 @@ mod tests {
             let changed = sample();
             assert_ne!(changed, clean);
             let mut triggered = false;
-            for _ in 0..8 {
+            for index in 8..16 {
                 triggered |= detector
-                    .on_sample(&observe::downscale_gray(&changed, 160))
+                    .on_sample(&observe::downscale_gray(&changed, 160), index * 600, 0)
                     .triggered;
             }
             assert!(
@@ -604,6 +939,173 @@ mod tests {
         assert_eq!(screen_point(region, 0, 0), (-2560, 180));
         assert_eq!(screen_point(region, 1000, 1000), (-1, 1619));
         assert_eq!(screen_point(region, 500, 500), (-1280, 900));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires an interactive desktop; moves and restores the pointer, without clicking"]
+    fn reported_drag_coordinates_reach_expected_screen_pixels() {
+        // Test executables do not embed the application's PerMonitorV2 manifest.
+        let _ = initialize_dpi();
+        let mut input = new_input().unwrap();
+        let original = input.location().unwrap();
+        struct RestorePointer((i32, i32));
+        impl Drop for RestorePointer {
+            fn drop(&mut self) {
+                if let Ok(mut input) = new_input() {
+                    let _ = move_mouse(&mut input, self.0 .0, self.0 .1);
+                }
+            }
+        }
+        let _restore = RestorePointer(original);
+        let region = Region {
+            x: 143,
+            y: 103,
+            width: 1637,
+            height: 922,
+        };
+        monitor_for_region(region).unwrap();
+        for (normalized, expected) in [
+            ((796, 920), (1445, 950)),
+            ((796, 600), (1445, 656)),
+            ((795, 920), (1444, 950)),
+            ((500, 650), (961, 702)),
+        ] {
+            let point = screen_point(region, normalized.0, normalized.1);
+            assert_eq!(point, expected);
+            move_mouse(&mut input, point.0, point.1).unwrap();
+            wait(70, &|| false).unwrap();
+            let actual = input.location().unwrap();
+            println!("normalized={normalized:?} expected={expected:?} actual={actual:?}");
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires an interactive desktop; sends click/drag only to a temporary test window"]
+    fn native_window_receives_held_click_and_drag_endpoints() {
+        use std::{cell::RefCell, sync::mpsc};
+        use windows::{
+            core::w,
+            Win32::{Foundation::*, UI::WindowsAndMessaging::*},
+        };
+        thread_local! {
+            static EVENTS: RefCell<Vec<(u32, i32, i32, Instant)>> = const { RefCell::new(Vec::new()) };
+        }
+        unsafe extern "system" fn receive(
+            hwnd: HWND,
+            message: u32,
+            wp: WPARAM,
+            lp: LPARAM,
+        ) -> LRESULT {
+            if matches!(message, WM_LBUTTONDOWN | WM_LBUTTONUP) {
+                EVENTS.with(|events| {
+                    events.borrow_mut().push((
+                        message,
+                        lp.0 as i16 as i32,
+                        (lp.0 >> 16) as i16 as i32,
+                        Instant::now(),
+                    ))
+                });
+            }
+            DefWindowProcW(hwnd, message, wp, lp)
+        }
+        struct Restore(HWND, HWND, (i32, i32));
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                    let _ = UnregisterClassW(w!("VlmPointerReceiverTest"), None);
+                    let _ = SetForegroundWindow(self.1);
+                }
+                if let Ok(mut input) = new_input() {
+                    let _ = move_mouse(&mut input, self.2 .0, self.2 .1);
+                }
+            }
+        }
+        let _ = initialize_dpi();
+        unsafe {
+            let class = WNDCLASSW {
+                lpfnWndProc: Some(receive),
+                lpszClassName: w!("VlmPointerReceiverTest"),
+                ..Default::default()
+            };
+            assert_ne!(RegisterClassW(&class), 0);
+            let original = new_input().unwrap().location().unwrap();
+            let foreground = GetForegroundWindow();
+            let hwnd = CreateWindowExW(
+                WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+                class.lpszClassName,
+                w!("Pointer input regression test"),
+                WS_POPUP,
+                200,
+                200,
+                320,
+                240,
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+            let _restore = Restore(hwnd, foreground, original);
+            let _ = ShowWindow(hwnd, SW_SHOWNORMAL);
+            let _ = SetForegroundWindow(hwnd);
+            let (sender, receiver) = mpsc::channel();
+            let worker = thread::spawn(move || {
+                let result = (|| {
+                    let mut input = new_input()?;
+                    click(&mut input, (240, 240), Button::Left, 1, &|| false)?;
+                    drag(
+                        &mut input,
+                        (240, 240),
+                        (440, 340),
+                        Button::Left,
+                        300,
+                        &|| false,
+                    )
+                })();
+                sender.send(result).unwrap();
+            });
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let result = loop {
+                let mut message = MSG::default();
+                while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                    let _ = TranslateMessage(&message);
+                    DispatchMessageW(&message);
+                }
+                if let Ok(result) = receiver.try_recv() {
+                    break result;
+                }
+                assert!(Instant::now() < deadline, "native input test timed out");
+                thread::sleep(Duration::from_millis(2));
+            };
+            worker.join().unwrap();
+            result.unwrap();
+            // Drain any final queued button-up before checking receipt.
+            let mut message = MSG::default();
+            while PeekMessageW(&mut message, None, 0, 0, PM_REMOVE).as_bool() {
+                DispatchMessageW(&message);
+            }
+            EVENTS.with(|events| {
+                let events = events.borrow();
+                assert_eq!(
+                    events
+                        .iter()
+                        .map(|(message, x, y, _)| (*message, *x, *y))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (WM_LBUTTONDOWN, 40, 40),
+                        (WM_LBUTTONUP, 40, 40),
+                        (WM_LBUTTONDOWN, 40, 40),
+                        (WM_LBUTTONUP, 240, 140),
+                    ]
+                );
+                assert!(events[1].3.duration_since(events[0].3) >= Duration::from_millis(40));
+                assert!(events[3].3.duration_since(events[2].3) >= Duration::from_millis(450));
+            });
+        }
     }
     #[test]
     fn key_names_and_cancellation() {

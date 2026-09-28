@@ -148,6 +148,21 @@ recorded during a stable capture. A successful gate consumes the token.
 Mouse actions invalidate the stored keyboard frame but do not use the same
 frame-age/foreground gate.
 
+Mouse clicks hold down for 60ms rather than sending down/up in the same tick.
+Drags hover at the source for 100ms, hold at pickup for 100ms, move for 500ms,
+and dwell at the destination for 80ms before release. Click/drag positions are
+read back before pressing (and at the drag destination); an error over two physical
+pixels allows one local reposition before a click is pressed; a single/double-click
+call shares that one retry, and previously dispatched clicks are never replayed.
+Persistent displacement still fails, and drag endpoint checks remain strict with
+no corrective retry. Moving the pointer between actions does not itself fail the
+next click. This does not provide simultaneous user/agent mouse ownership.
+Pressed buttons are released on cooperative cancellation
+and input errors. Native pointer-target/completion logs include planned physical
+coordinates and actual final coordinates, but cannot verify application acceptance.
+Markers use the same normalized-to-pixel function as input and remain instruction
+annotations, not recorded movement or proof of success.
+
 Keyboard input checks cancellation, foreground changes, and F8 while running.
 Once tripped, the operation stays cancelled. Pressed keys are released in
 reverse order; a drag attempts to release its mouse button on failure.
@@ -166,12 +181,49 @@ be undone, and not every capture or delay is instantly interruptible.
 | Full auto capture | After a formal reply, when explicitly enabled (normally fifteen seconds) | New round and operation |
 
 One timer governs the post-action wait, and it is the same setting for every
-tool. Early probing pauses for four seconds from receipt of the model's action
-output, counting action execution time toward the cooldown. The original capture
-deadline is not extended, even if it expires during the cooldown, and the pause
-remains cancellable by the UI or F8. After the cooldown, native sampling compares
-the region against the frame the model last saw; when the screen changes and then
-holds still, the wait ends
+tool. Early wake is locked for four seconds from receipt of the model's action
+output, counting action execution time. Sampling starts after input completes,
+including the remaining guard period. The original capture deadline is not
+extended, even if it expires during calibration, and stop/F8 remain active.
+The frame the model last saw remains the change reference; a separate noise
+reference comes from the quietest multi-frame window spanning at least 1.2 seconds
+during calibration. A normalized maximum of global mean, peak block mean and
+active-pixel fraction selects the quietest window. Thresholds derived from it
+are capped, so a continuously moving loading screen cannot redefine motion as
+noise. Missing/short calibration uses conservative defaults.
+
+After unlock, complete confirmation windows continue updating the quietest score.
+The active noise reference may move in either direction using a 90% old/10% new
+exponential update, at most once per 1.8 seconds. Only windows already within the
+previous limits qualify; evaluation happens before adaptation, and changes apply
+to subsequent windows only. The reference components are also capped before
+blending, preventing a noisy warmup from causing long decay. This adapts modest
+ambient noise without letting sustained motion train itself into stability.
+It does not learn a persistent animated counter as an ignored region, and does
+not replace the pre-action image used to establish that a change occurred.
+
+The detector uses a 320-pixel-long-edge grayscale image, 24 grid columns, and
+8-24 rows. After unlock it starts a fresh rolling window of at least four frames
+spanning 1.8 seconds; it never banks stable time from calibration. Per-pixel
+max-minus-min across the entire window catches cumulative drift and intervening
+changes, rather than comparing only adjacent frames. Both global and worst-block
+means and the fraction of pixels varying by at least eight grayscale levels must
+fit the noise limits. Limits are clamped to 0.4-1.5 for global mean, 2-60 for peak
+block mean, and 0.1-2% for active pixels. These are adaptive ceilings, not fixed
+allowances: quiet or missing calibration still uses 0.4/2/0.1%. The wider local
+ceilings tolerate limited recurring activity after the main animation ends;
+global motion, larger active areas and strong local transitions still block wake.
+Calibration ranking keeps its original weights (1.5/5/0.003), independently of
+these ceilings. This is not semantic recognition of a counter or game turn, and
+small animations within all three learned limits may be accepted as stable.
+A persistent difference from the old
+frame is also required, including strong local changes. Returning to the old
+frame clears that eligibility; sample gaps over 900ms clear confirmation history.
+Sampling adapts through 150/250/600ms and subtracts capture/analysis cost from
+sleep, with wakeups bounded by unlock and deadline. Confirmation targets roughly
+two seconds after stability, not a hard real-time guarantee. Uncertain cases
+wait for the deadline; visually static loading/turn pauses remain ambiguous.
+When the screen changes and then holds still, the wait ends
 early and the new screenshot is returned without spending the rest of the
 budget. A `wait` that follows such an early wake resumes only the unspent
 remainder and does not probe again, so a round cannot extend its own deadline
@@ -183,16 +235,28 @@ screenshot service. `end_round` does not disable it.
 
 During probing, the app window remains visible but is excluded from capture via
 `WDA_EXCLUDEFROMCAPTURE` on Windows 10 2004 or later. The previous display affinity
-is restored when the sampling worker exits, including cancellation and errors.
+is restored when observation finishes, including cancellation and errors. The
+worker owns cleanup while sampling and transfers the guards to final capture on
+success; dropped command futures still release them.
 Unsupported systems or an exclusion error fall back to hiding during sampling.
 This is not a pixel mask: the detector still observes content underneath the app.
 Other capture tools honoring display affinity also omit the app during this period.
 
 Detection returns only a wake/deadline decision, not a model image or keyboard
 target. The final screenshot separately hides the app, waits for its fade-out,
-and records a fresh image, baseline and stable foreground token. Input-time
-hiding and keyboard focus checks are unchanged. `waitedMs` freezes at the detection
+and records a fresh image, baseline and stable foreground token before restoring
+the app. A previously focused app is shown, focused and raised without changing
+its permanent topmost state; background/minimized windows do not request focus.
+Fallback hidden sampling retains its restore guard through final capture to avoid
+a show/hide race. Input-time hiding and keyboard target checks remain in place;
+input completion now also restores an originally foreground app. `waitedMs` freezes at the detection
 decision; final capture overhead does not consume a paused timer's remainder.
+Logs distinguish local probe samples, calibration/noise metrics, decision/final
+capture start, window hiding, and restored visibility/focus. `motionFraction`
+now measures active pixels over the confirmation window, not moving grid blocks.
+`adaptive-window-v4` widens only the local noise ceilings, retaining the v3
+`noiseUpdated` and `quietestScore` metrics. The logged noise and thresholds
+describe the reference used for that sample, before any update.
 
 ## Boundaries and Non-Goals
 

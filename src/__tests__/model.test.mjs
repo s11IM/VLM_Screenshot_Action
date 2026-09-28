@@ -36,6 +36,11 @@ test("tools require both explicit enablement and a current observation", () => {
   assert.equal(availableActionTools(true, true), ACTION_TOOLS);
 });
 
+test("action markers are described as instructions, not proof of target response", () => {
+  assert.ok(SYSTEM_PROMPT.includes("不是实际鼠标轨迹"));
+  assert.ok(SYSTEM_PROMPT.includes("输入已发送不等于操作成功"));
+});
+
 test("context selection preserves a cropped task and latest eligible summary", () => {
   const conversation = { messages: [
     { role: "user", cycleId: "task", text: "Reach the exit" },

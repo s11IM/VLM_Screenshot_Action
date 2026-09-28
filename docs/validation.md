@@ -28,9 +28,19 @@ Use the application's locked capture dependencies:
 
 ```powershell
 cargo test --locked --manifest-path src-tauri/Cargo.toml -p desktop-automation-core capture_exclusion_keeps_window_visible_but_samples_underneath -- --ignored --nocapture --test-threads=1
+cargo test --locked --manifest-path src-tauri/Cargo.toml -p desktop-automation-core restored_window_returns_above_target_without_becoming_topmost -- --ignored --nocapture --test-threads=1
+cargo test --locked --manifest-path src-tauri/Cargo.toml -p desktop-automation-core reported_drag_coordinates_reach_expected_screen_pixels -- --ignored --nocapture --test-threads=1
+cargo test --locked --manifest-path src-tauri/Cargo.toml -p desktop-automation-core native_window_receives_held_click_and_drag_endpoints -- --ignored --nocapture --test-threads=1
 ```
 
 This native test does not replace a smoke test of the actual Tauri/WebView2 UI.
+The restoration test hides/raises native windows repeatedly and checks visibility,
+z-order and absence of permanent topmost status. It does not validate every
+Windows foreground-activation policy or exclusive-fullscreen application.
+Pointer checks move and restore the cursor. The coordinate fixture requires the
+reported region (143,103,1637,922) to fit the desktop. The input receiver test
+creates a temporary native window and verifies received button coordinates and
+hold timing; it does not interact with the game or prove its input compatibility.
 
 ## Contract Coverage
 
@@ -44,6 +54,12 @@ This native test does not replace a smoke test of the actual Tauri/WebView2 UI.
 | Public package privacy gate and core-library rebuild detection | `src/__tests__/scripts.test.mjs` (temporary fixtures only) |
 | Coordinate edges and release of keys after cancellation | `desktop-core/src/lib.rs` tests |
 | Keyboard frame lifetime, foreground binding, DPI mapping | `src-tauri/src/lib.rs` tests |
+| Warmup calibration, fresh timed confirmation, local/slow/intermittent motion, scene return, missing samples | `desktop-core/src/observe.rs` tests |
+| Capture-cost-aware cadence, deadline/cancellation, cleanup on errors and dropped futures | `src-tauri/src/lib.rs` tests |
+| Continuous bounded noise updates, update spacing, motion cannot train itself as stable | `desktop-core/src/observe.rs` tests |
+| Calibrated local activity after opponent motion, independent motion caps, strict quiet-calibration limits | `desktop-core/src/observe.rs` tests |
+| Mouse button release, marker/input coordinate consistency, annotation semantics | Rust input/backend tests and `src/__tests__/model.test.mjs` |
+| One pre-click reposition, no replay of sent clicks, persistent drift and cancellation | `desktop-core/src/lib.rs` recording mouse tests |
 
 These checks do not prove that a game accepts injected input, that a model
 obeys the prompt, or that the React orchestration is race-free. The complete
@@ -75,11 +91,27 @@ payment page, privileged application, or account with valuable state.
 - [ ] Manual screenshot excludes the app window and displays correctly.
 - [ ] Sending text or an uploaded reference alone does not offer action tools.
 - [ ] A click/hover/drag executes once, then a fresh image is observed.
-- [ ] Early probing stays off for four seconds after model action output; a shorter
-      capture deadline still wins, and stop/F8 interrupts the cooldown.
+- [ ] Actual pointer target/completion logs agree with the selected region; a
+      game's response is checked independently of drawn arrows or dispatch success.
+- [ ] One transient pre-click displacement is corrected locally; sustained
+      displacement fails without duplicate clicks, and drag checks stay strict.
+- [ ] Noise-reference updates continue after the guard, without accepting ongoing
+      animation or slow changes merely by raising thresholds.
+- [ ] Sampling calibrates during the four-second guard after model action output,
+      without early wake; a shorter deadline still wins, and stop/F8 interrupts.
+- [ ] Game-like opponent animation, incremental browser updates, and application
+      startup transitions block early wake until about two seconds of stability.
+- [ ] Slow drift, above-limit local motion and brief intermediate pauses do not
+      accumulate stability; substantial continuous animation reaches the deadline.
+- [ ] In Mahjong Soul bot play, limited calibrated local activity can remain after
+      opponents finish without blocking wake; confirm the model screenshot is timely.
 - [ ] With the app overlapping the region, its text updates and movement do not
       trigger settling detection; changes underneath it still do. The final
       screenshot briefly hides the app and keyboard input targets the other app.
+- [ ] With the app initially foreground, manual/automatic capture, successful input,
+      cancellation and errors restore it above the target without permanent topmost.
+- [ ] Initially minimized/background windows do not steal focus; repeated captures
+      preserve position, maximized state, and the following keyboard target check.
 - [ ] Cancellation restores capture affinity; exclusion failures use hidden sampling.
 - [ ] Disabling tool-result capture prevents the next model iteration after input.
 - [ ] Keyboard input requires a fresh matching frame; switching focus interrupts it.

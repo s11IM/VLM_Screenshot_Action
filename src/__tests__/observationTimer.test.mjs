@@ -4,7 +4,7 @@ import { observationProbeDelay, observationWindow, pausedObservationRemainder } 
 
 const settings = { operationCaptureDelay: 8, earlyProbeEnabled: true };
 
-test("probing is suppressed for four seconds from model action output, not action completion", () => {
+test("early wake stays locked for four seconds from model action output, not action completion", () => {
   assert.equal(observationProbeDelay(1000, 1000), 4000);
   assert.equal(observationProbeDelay(1000, 1750), 3250);
   assert.equal(observationProbeDelay(1000, 4999), 1);

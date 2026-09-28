@@ -1,7 +1,7 @@
 {
   "name": "vlm_screenshot_action",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A Windows reference implementation of a screenshot-driven visual model control loop",
   "license": "MIT",
   "repository": {

@@ -1,6 +1,7 @@
 import type { RegionObservation, Settings } from "./types.ts";
 
 export function observationProbeDelay(actionOutputAtMs: number, nowMs: number): number {
+  // Sampling calibrates during this window; only early wake is locked.
   return Math.max(0, Math.ceil(4000 - (nowMs - actionOutputAtMs)));
 }
 
