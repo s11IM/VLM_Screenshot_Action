@@ -77,7 +77,7 @@ impl Default for ObserveParams {
         Self {
             sample_interval_ms: 150,
             slow_interval_ms: 250,
-            slowest_interval_ms: 400,
+            slowest_interval_ms: 700,
             sample_cost_threshold_ms: 40,
             long_edge: 160,
             grid_cols: 12,
@@ -651,7 +651,7 @@ mod tests {
         let p = ObserveParams::default();
         assert_eq!(p.sample_interval_ms, 150);
         assert_eq!(p.slow_interval_ms, 250);
-        assert_eq!(p.slowest_interval_ms, 400);
+        assert_eq!(p.slowest_interval_ms, 700);
         assert_eq!(p.sample_cost_threshold_ms, 40);
         assert_eq!(p.long_edge, 160);
         assert_eq!(p.grid_cols, 12);

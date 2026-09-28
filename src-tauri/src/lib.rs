@@ -2582,13 +2582,13 @@ mod tests {
         );
         assert_eq!(
             next_interval(250, params.sample_cost_threshold_ms + 1, &params),
-            400
+            700
         );
         assert_eq!(
-            next_interval(400, params.sample_cost_threshold_ms + 1, &params),
-            400
+            next_interval(700, params.sample_cost_threshold_ms + 1, &params),
+            700
         );
-        assert_eq!(next_interval(400, 0, &params), 400);
+        assert_eq!(next_interval(700, 0, &params), 700);
     }
 
     #[test]
