@@ -44,7 +44,9 @@ sequenceDiagram
         end
         Note over Controller,Desktop: Input dispatch is not proof of task success
         opt Continue with automatic observation
-            Controller->>Native: capture_region after settling delay
+            Controller->>Native: observe_region
+            Native->>Desktop: Sample with app excluded from capture
+            Note over Native,Desktop: Keep app visible during detection; hide for final screenshot
             Native->>Desktop: Capture selected region
             Native-->>Controller: PNG data URL and frameId
         end
@@ -178,6 +180,19 @@ by waiting. A fresh action resets the timer.
 Early probing is optional and can be switched off, which restores a plain
 timed wait. Full auto capture is completion-triggered, not a fixed interval
 screenshot service. `end_round` does not disable it.
+
+During probing, the app window remains visible but is excluded from capture via
+`WDA_EXCLUDEFROMCAPTURE` on Windows 10 2004 or later. The previous display affinity
+is restored when the sampling worker exits, including cancellation and errors.
+Unsupported systems or an exclusion error fall back to hiding during sampling.
+This is not a pixel mask: the detector still observes content underneath the app.
+Other capture tools honoring display affinity also omit the app during this period.
+
+Detection returns only a wake/deadline decision, not a model image or keyboard
+target. The final screenshot separately hides the app, waits for its fade-out,
+and records a fresh image, baseline and stable foreground token. Input-time
+hiding and keyboard focus checks are unchanged. `waitedMs` freezes at the detection
+decision; final capture overhead does not consume a paused timer's remainder.
 
 ## Boundaries and Non-Goals
 

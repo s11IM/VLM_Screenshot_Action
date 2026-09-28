@@ -21,6 +21,17 @@ dependencies. It does not launch the executable or publish artifacts.
 The two Rust manifests are independent; testing the Tauri crate alone does
 not run the dependency crate's unit tests.
 
+The opt-in capture exclusion test briefly shows native test windows on an
+interactive Windows desktop. It verifies visible-window exclusion, immunity to
+overlay movement, detection of changes underneath, and display-affinity cleanup.
+Use the application's locked capture dependencies:
+
+```powershell
+cargo test --locked --manifest-path src-tauri/Cargo.toml -p desktop-automation-core capture_exclusion_keeps_window_visible_but_samples_underneath -- --ignored --nocapture --test-threads=1
+```
+
+This native test does not replace a smoke test of the actual Tauri/WebView2 UI.
+
 ## Contract Coverage
 
 | Contract | Tests |
@@ -66,6 +77,10 @@ payment page, privileged application, or account with valuable state.
 - [ ] A click/hover/drag executes once, then a fresh image is observed.
 - [ ] Early probing stays off for four seconds after model action output; a shorter
       capture deadline still wins, and stop/F8 interrupts the cooldown.
+- [ ] With the app overlapping the region, its text updates and movement do not
+      trigger settling detection; changes underneath it still do. The final
+      screenshot briefly hides the app and keyboard input targets the other app.
+- [ ] Cancellation restores capture affinity; exclusion failures use hidden sampling.
 - [ ] Disabling tool-result capture prevents the next model iteration after input.
 - [ ] Keyboard input requires a fresh matching frame; switching focus interrupts it.
 - [ ] Holding F8 during a long key hold stops it and releases pressed keys.

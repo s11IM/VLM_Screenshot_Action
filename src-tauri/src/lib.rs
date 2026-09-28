@@ -103,10 +103,7 @@ struct ObservedImage {
     trigger: Option<TriggerInfo>,
 }
 
-struct ObservationCapture {
-    image: xcap::image::RgbaImage,
-    foreground: usize,
-    thumb: desktop::observe::GrayImage,
+struct ObservationResult {
     outcome: String,
     waited_ms: u64,
     samples: u32,
@@ -1207,7 +1204,7 @@ fn run_observation(
     stored_baseline: Option<desktop::observe::GrayImage>,
     cancelled: Arc<AtomicBool>,
     started: Instant,
-) -> Result<ObservationCapture, String> {
+) -> Result<ObservationResult, String> {
     let params = desktop::observe::ObserveParams::default();
     if probe_enabled {
         // Do not sample during the cooldown or extend the original capture deadline.
@@ -1218,20 +1215,7 @@ fn run_observation(
     }
     if !probe_enabled || started.elapsed() >= deadline {
         interruptible_sleep(deadline.saturating_sub(started.elapsed()), &cancelled)?;
-        let foreground_before = desktop::foreground_window();
-        let image = desktop::capture_region(region)?;
-        let foreground_after = desktop::foreground_window();
-        let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
-        check_observation_cancelled(&cancelled)?;
-        let foreground = if foreground_before != 0 && foreground_before == foreground_after {
-            foreground_before
-        } else {
-            0
-        };
-        return Ok(ObservationCapture {
-            image,
-            foreground,
-            thumb,
+        return Ok(ObservationResult {
             outcome: "deadline".into(),
             waited_ms: elapsed_ms(started),
             samples: 0,
@@ -1254,20 +1238,7 @@ fn run_observation(
     loop {
         check_observation_cancelled(&cancelled)?;
         if started.elapsed() >= deadline {
-            let foreground_before = desktop::foreground_window();
-            let image = desktop::capture_region(region)?;
-            let foreground_after = desktop::foreground_window();
-            let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
-            check_observation_cancelled(&cancelled)?;
-            let foreground = if foreground_before != 0 && foreground_before == foreground_after {
-                foreground_before
-            } else {
-                0
-            };
-            return Ok(ObservationCapture {
-                image,
-                foreground,
-                thumb,
+            return Ok(ObservationResult {
                 outcome: "deadline".into(),
                 waited_ms: elapsed_ms(started),
                 samples: u32::try_from(sample_elapsed.len()).unwrap_or(u32::MAX),
@@ -1276,20 +1247,13 @@ fn run_observation(
         }
 
         let sample_started = Instant::now();
-        let foreground_before = desktop::foreground_window();
         let image = desktop::capture_region(region)?;
-        let foreground_after = desktop::foreground_window();
         let thumb = desktop::observe::downscale_gray(&image, params.long_edge);
         let sample_outcome = detector.on_sample(&thumb);
         let sample_cost_ms =
             u64::try_from(sample_started.elapsed().as_millis()).unwrap_or(u64::MAX);
         let now_ms = elapsed_ms(started);
         sample_elapsed.push(now_ms);
-        let foreground = if foreground_before != 0 && foreground_before == foreground_after {
-            foreground_before
-        } else {
-            0
-        };
         let metrics = &sample_outcome.metrics;
         if !(metrics.state == "armed"
             && metrics.changed_fraction == 0.0
@@ -1318,10 +1282,7 @@ fn run_observation(
                 .changed_at_sample()
                 .and_then(|index| sample_elapsed.get(index as usize).copied())
                 .unwrap_or(now_ms);
-            return Ok(ObservationCapture {
-                image,
-                foreground,
-                thumb,
+            return Ok(ObservationResult {
                 outcome: if deadline_reached {
                     "deadline"
                 } else {
@@ -1414,31 +1375,6 @@ async fn observe_region(
     };
     check_observation_cancelled(&cancelled)?;
     *captures.frame.lock().map_err(|_| "截图状态不可用")? = None;
-    let presentation = match hide_window_for_background_action(&window) {
-        Ok(presentation) => presentation,
-        Err(error) => {
-            log_event(
-                "error",
-                "observation.failed",
-                json!({
-                    "error": error,
-                    "durationMs": started.elapsed().as_millis(),
-                    "operationId": operation_id,
-                    "roundId": round_id,
-                    "captureKind": capture_kind,
-                    "toolStep": tool_step,
-                    "region": region_metadata(region),
-                }),
-            );
-            return Err(error);
-        }
-    };
-    let restore_guard = WindowRestoreGuard::new(move || {
-        restore_window_after_background_action(&window, presentation, false);
-    });
-    if presentation.hidden_for_action {
-        tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
-    }
     let stored_baseline = if probe_enabled {
         match captures.baseline.lock() {
             Ok(guard) => guard
@@ -1466,20 +1402,72 @@ async fn observe_region(
     } else {
         None
     };
+
+    #[cfg(windows)]
+    let exclusion = if probe_enabled {
+        match window
+            .hwnd()
+            .map_err(|error| error.to_string())
+            .and_then(|hwnd| desktop::CaptureExclusion::new(hwnd.0 as usize))
+        {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                log_event(
+                    "warn",
+                    "observation.exclusion_failed",
+                    json!({ "error": error }),
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(windows)]
+    let keep_visible = !probe_enabled || exclusion.is_some();
+    #[cfg(not(windows))]
+    let keep_visible = !probe_enabled;
+
+    log_event(
+        "debug",
+        "observation.window_mode",
+        json!({
+            "probeEnabled": probe_enabled,
+            "captureExcluded": probe_enabled && keep_visible,
+            "hideFallback": !keep_visible,
+        }),
+    );
+    let sampling_restore = if keep_visible {
+        None
+    } else {
+        let presentation = hide_window_for_background_action(&window)?;
+        let sampling_window = window.clone();
+        let guard = WindowRestoreGuard::new(move || {
+            restore_window_after_background_action(&sampling_window, presentation, false);
+        });
+        if presentation.hidden_for_action {
+            tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
+        }
+        Some(guard)
+    };
+    let sampling_cancelled = Arc::clone(&cancelled);
     let loop_result = tauri::async_runtime::spawn_blocking(move || {
+        // Keep exclusion/fallback alive even if the awaiting command future is dropped.
+        #[cfg(windows)]
+        let _exclusion = exclusion;
+        let _sampling_restore = sampling_restore;
         run_observation(
             region,
             Duration::from_millis(deadline),
             probe_enabled,
             probe_delay_ms,
             stored_baseline,
-            cancelled,
+            sampling_cancelled,
             started,
         )
     })
     .await
     .map_err(|error| error.to_string());
-    restore_guard.restore();
     let observed = match loop_result {
         Ok(Ok(observed)) => observed,
         Ok(Err(error)) | Err(error) => {
@@ -1499,7 +1487,30 @@ async fn observe_region(
             return Err(error);
         }
     };
-    let mut image = observed.image;
+    // Probe frames are never used as model screenshots or keyboard focus tokens.
+    check_observation_cancelled(&cancelled)?;
+    let presentation = hide_window_for_background_action(&window)?;
+    let restore_guard = WindowRestoreGuard::new(move || {
+        restore_window_after_background_action(&window, presentation, false);
+    });
+    if presentation.hidden_for_action {
+        tokio::time::sleep(Duration::from_millis(WINDOW_HIDE_SETTLE_MS)).await;
+    }
+    check_observation_cancelled(&cancelled)?;
+    let foreground_before = desktop::foreground_window();
+    let mut image = desktop::capture_region(region)?;
+    let foreground_after = desktop::foreground_window();
+    check_observation_cancelled(&cancelled)?;
+    let foreground = if foreground_before != 0 && foreground_before == foreground_after {
+        foreground_before
+    } else {
+        0
+    };
+    let thumb = desktop::observe::downscale_gray(
+        &image,
+        desktop::observe::ObserveParams::default().long_edge,
+    );
+    restore_guard.restore();
     draw_region_markers(
         &mut image,
         region,
@@ -1532,13 +1543,11 @@ async fn observe_region(
         *captures.frame.lock().map_err(|_| "截图状态不可用")? = Some(CapturedFrame {
             id: frame_id.clone(),
             region,
-            foreground: observed.foreground,
+            foreground,
             created: Instant::now(),
         });
-        *captures.baseline.lock().map_err(|_| "截图状态不可用")? = Some(BaselineFrame {
-            region,
-            thumb: observed.thumb.clone(),
-        });
+        *captures.baseline.lock().map_err(|_| "截图状态不可用")? =
+            Some(BaselineFrame { region, thumb });
         Ok::<(), String>(())
     })() {
         log_event(
@@ -2517,6 +2526,32 @@ mod tests {
             Instant::now(),
         );
         assert_eq!(result.err().as_deref(), Some("本轮操作已取消"));
+    }
+
+    #[test]
+    fn observation_deadline_returns_decision_without_capturing() {
+        // An invalid capture region proves timer-only paths do not touch the desktop.
+        let region = Region {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 0,
+        };
+        for probe_enabled in [false, true] {
+            let observed = run_observation(
+                region,
+                Duration::ZERO,
+                probe_enabled,
+                4000,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Instant::now(),
+            )
+            .unwrap();
+            assert_eq!(observed.outcome, "deadline");
+            assert_eq!(observed.samples, 0);
+            assert!(observed.trigger.is_none());
+        }
     }
 
     #[test]

@@ -53,6 +53,68 @@ pub fn capture_region(region: Region) -> Result<RgbaImage> {
         .map_err(|e| e.to_string())
 }
 
+#[cfg(windows)]
+pub struct CaptureExclusion {
+    window: usize,
+    previous_affinity: u32,
+}
+
+#[cfg(windows)]
+impl CaptureExclusion {
+    pub fn new(window: usize) -> Result<Self> {
+        use windows::{
+            Wdk::System::SystemServices::RtlGetVersion,
+            Win32::{
+                Foundation::HWND,
+                Graphics::Dwm::DwmFlush,
+                System::SystemInformation::OSVERSIONINFOW,
+                UI::WindowsAndMessaging::{
+                    GetWindowDisplayAffinity, SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE,
+                },
+            },
+        };
+        unsafe {
+            let mut version = OSVERSIONINFOW {
+                dwOSVersionInfoSize: std::mem::size_of::<OSVERSIONINFOW>() as u32,
+                ..Default::default()
+            };
+            RtlGetVersion(&mut version)
+                .ok()
+                .map_err(|e| e.to_string())?;
+            // Older Windows accepts this flag as WDA_MONITOR (a black box), not exclusion.
+            if version.dwBuildNumber < 19041 {
+                return Err("Capture exclusion requires Windows 10 2004 or later".into());
+            }
+            let hwnd = HWND(window as *mut std::ffi::c_void);
+            let mut previous_affinity = 0;
+            GetWindowDisplayAffinity(hwnd, &mut previous_affinity).map_err(|e| e.to_string())?;
+            SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE).map_err(|e| e.to_string())?;
+            let guard = Self {
+                window,
+                previous_affinity,
+            };
+            DwmFlush().map_err(|e| e.to_string())?;
+            Ok(guard)
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for CaptureExclusion {
+    fn drop(&mut self) {
+        use windows::Win32::{
+            Foundation::HWND,
+            UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WINDOW_DISPLAY_AFFINITY},
+        };
+        unsafe {
+            let _ = SetWindowDisplayAffinity(
+                HWND(self.window as *mut std::ffi::c_void),
+                WINDOW_DISPLAY_AFFINITY(self.previous_affinity),
+            );
+        }
+    }
+}
+
 pub fn screen_point(region: Region, x: i32, y: i32) -> (i32, i32) {
     (
         region.x + ((region.width.saturating_sub(1) as f64) * x as f64 / 1000.0).round() as i32,
@@ -393,6 +455,142 @@ mod tests {
         assert!(type_text(&mut input, "abc", 0, &|| true).is_err());
         assert!(input.keys.is_empty());
         assert!(input.text.is_empty());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn capture_exclusion_rejects_invalid_window() {
+        assert!(CaptureExclusion::new(0).is_err());
+    }
+
+    #[test]
+    #[cfg(windows)]
+    #[ignore = "requires an interactive Windows desktop; briefly shows test windows"]
+    fn capture_exclusion_keeps_window_visible_but_samples_underneath() {
+        use windows::{
+            core::w,
+            Win32::{
+                Foundation::{HWND, RECT},
+                Graphics::{Dwm::DwmFlush, Gdi::UpdateWindow},
+                UI::WindowsAndMessaging::*,
+            },
+        };
+        struct TestWindow(HWND);
+        impl Drop for TestWindow {
+            fn drop(&mut self) {
+                unsafe {
+                    let _ = DestroyWindow(self.0);
+                }
+            }
+        }
+        unsafe {
+            let _ = initialize_dpi();
+            let create = |static_style: u32| {
+                let window = TestWindow(
+                    CreateWindowExW(
+                        WS_EX_TOPMOST | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
+                        w!("STATIC"),
+                        w!("Capture exclusion test"),
+                        WS_POPUP | WINDOW_STYLE(static_style),
+                        96,
+                        96,
+                        240,
+                        160,
+                        None,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap(),
+                );
+                let _ = ShowWindow(window.0, SW_SHOWNOACTIVATE);
+                let _ = UpdateWindow(window.0);
+                window
+            };
+            let background = create(6); // SS_WHITERECT
+            let mut rect = RECT::default();
+            GetWindowRect(background.0, &mut rect).unwrap();
+            let region = Region {
+                x: rect.left + 40,
+                y: rect.top + 40,
+                width: 32,
+                height: 32,
+            };
+            let sample = || {
+                DwmFlush().unwrap();
+                thread::sleep(Duration::from_millis(100));
+                capture_region(region).unwrap()
+            };
+            let baseline = sample();
+            let overlay = create(4); // SS_BLACKRECT
+            SetWindowPos(
+                overlay.0,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let before = sample();
+            assert_ne!(before.get_pixel(16, 16), baseline.get_pixel(16, 16));
+            let guard = CaptureExclusion::new(overlay.0 .0 as usize).unwrap();
+            assert!(IsWindowVisible(overlay.0).as_bool());
+            let clean = sample();
+            assert_eq!(clean, baseline);
+            let mut detector = observe::SettleDetector::new(
+                observe::ObserveParams::default(),
+                observe::downscale_gray(&clean, 160),
+            );
+            for offset in [0, 10, 20, 0, 10, 20, 0, 10] {
+                SetWindowPos(
+                    overlay.0,
+                    Some(HWND_TOPMOST),
+                    rect.left + offset,
+                    rect.top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOACTIVATE,
+                )
+                .unwrap();
+                let image = sample();
+                let out = detector.on_sample(&observe::downscale_gray(&image, 160));
+                assert_eq!(out.metrics.changed_fraction, 0.0);
+                assert_eq!(out.metrics.motion_fraction, 0.0);
+                assert!(!out.triggered);
+            }
+            let _changed_background = create(4);
+            SetWindowPos(
+                overlay.0,
+                Some(HWND_TOPMOST),
+                0,
+                0,
+                0,
+                0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE,
+            )
+            .unwrap();
+            let changed = sample();
+            assert_ne!(changed, clean);
+            let mut triggered = false;
+            for _ in 0..8 {
+                triggered |= detector
+                    .on_sample(&observe::downscale_gray(&changed, 160))
+                    .triggered;
+            }
+            assert!(
+                triggered,
+                "background changes under an excluded window must still trigger"
+            );
+            drop(guard);
+            let mut affinity = u32::MAX;
+            GetWindowDisplayAffinity(overlay.0, &mut affinity).unwrap();
+            assert_eq!(affinity, WDA_NONE.0);
+            let restored = sample();
+            assert!(IsWindowVisible(overlay.0).as_bool());
+            assert_eq!(restored, before);
+        }
     }
 
     #[test]

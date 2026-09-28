@@ -76,7 +76,7 @@ flowchart TD
     E --> E2[Remember where it acted and mark that spot with a red dot<br/>typing and key presses get no red dot]
     E2 --> H{Is auto-screenshot after tools on?}
     H -- no, and this step was not a wait --> H2([The round stops; it waits for you to capture by hand])
-    H -- yes --> I[Hide the window; pause early probing for 4 s after model action output<br/>then capture early on change and settle, or when the original time is up]
+    H -- yes --> I[Pause early probing for 4 s after model action output<br/>exclude the app while probing; hide and capture on settle or deadline]
     I --> J[The new screenshot becomes the starting point of the next cycle]
     J --> C
     R --> K{Is full auto on?}
@@ -94,6 +94,7 @@ Details that the diagram leaves out but the code really does:
 - **Failed steps do not consume the wait.** A step that was not executed or failed never starts the wait timer; the app grabs a fresh screenshot right away and asks the model again (`App.tsx:959-979`). Only an action that truly ran goes on to "wait for the screen to settle", and only that successful path clears the remainder left over from an early wake (`App.tsx:834-835`).
 - **A `wait` after an early wake resumes from the pause point.** If the screen changes and then settles during the wait, the model is woken early and the remaining time is stored; if it then picks `wait`, that remaining time is used to keep waiting (with no further probing), while any other action restarts the full timer (`observationTimer.ts`).
 - **Action output starts a 4-second probe cooldown.** It starts when the model action response is received, including action execution time. Early-wake probing pauses during it; the original capture deadline is not extended, and stop/F8 still work. A resumed `wait` after an early wake still does not probe.
+- **Settling detection ignores the app; final screenshots still hide it.** Where supported, Windows capture exclusion keeps the app visible while sampling the desktop underneath, so its text updates and movement do not count as screen changes. After detection, the app briefly hides for a fresh screenshot; input-time hiding is unchanged. Older systems or exclusion failures fall back to hidden sampling.
 - **Turning off early probing** falls back to a plain timer: sleep the configured time and take one screenshot, with no early wake.
 - **A brand-new round needs a screenshot of its own before the model gets any tools.** Only three attachment sources count as an actionable frame: manual capture, full auto, and the capture taken after a tool ran; an image you upload from a file is reference only and never counts (`model.ts:248-253`). So a first round where you only selected a region and typed a message offers no tools at all and the model can only reply with text; the tools appear once a later round carries a capture.
 - **A failed request is retried once** (3 s apart by default), with the request timeout configurable (60 s by default).
