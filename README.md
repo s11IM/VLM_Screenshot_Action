@@ -70,33 +70,32 @@
 
 ## 控制流一览
 
-```mermaid
-sequenceDiagram
-    participant U as 用户
-    participant C as React 控制器
-    participant N as Rust / Tauri 原生层
-    participant M as 视觉模型 API
-    participant D as Windows 桌面
+用一句话概括它的运行逻辑：**每做一步动作，都要等画面稳定后再拍一张新照片，看清楚上一步有没有生效，再决定下一步怎么做。**
 
-    U->>C: 框选区域 · 截图 · 发送任务
-    C->>N: begin_operation
-    loop 直至正式回复 / end_round / 急停 / 连续 3 次失败
-        C->>C: 投影最近循环 · 仅保留 1 张 CURRENT_FRAME
-        C->>N: request_chat_completion
-        N->>M: POST /chat/completions
-        M-->>C: 返回策略分析与工具调用
-        C->>C: 适配协议 · 校验参数 · 仅取首个工具
-        opt 鼠标或键盘动作
-            C->>N: execute_input_action(region, frameId, action)
-            N->>D: 校验窗口焦点与坐标 · 派发原生输入
-        end
-        opt 自动观察下一帧
-            C->>N: observe_region
-            N->>D: 剔除自身窗口持续采样 · 趋稳或超时后静默截图
-            N-->>C: 返回新截图与新 frameId
-        end
+```mermaid
+flowchart TD
+    Start(["1. 准备出发<br/>框选屏幕区域 · 拍下第一张截图 · 输入任务目标"]) --> Context
+
+    subgraph Loop ["核心闭环（按 F8 或点击停止可随时中断）"]
+        direction TB
+        Context["2. 整理发给模型的资料<br/>保留任务目标与近期操作记录 · 只附带最新 1 张截图"] --> Think
+        Think{"3. 视觉模型看图思考<br/>接下来该做什么？"}
+
+        Think -->|"需要操作键鼠"| Act["4a. 执行单步动作<br/>点击 / 拖拽 / 移动 / 打字 / 按键<br/>（自动检查目标窗口有没有切走）"]
+        Think -->|"画面还在加载或动画中"| Wait["4b. 静默等待<br/>不乱点，耐心等画面自己动完"]
+        Think -->|"任务完成 / 需要人工决定"| Done(["5. 结束本轮运行<br/>向用户汇报结果"])
+
+        Act --> CheckFail{"连续 3 次执行失败？"}
+        CheckFail -->|"是（防止死循环）"| Stop(["自动安全停机<br/>提示用户检查窗口状态"])
+        CheckFail -->|"否"| Observe
+
+        Wait --> Observe["4c. 等待画面稳定并拍新照片<br/>透过本软件窗口观察底层变化 · 画面稳定后立即截图"]
+        Observe -->|"拿到最新画面，确认刚才那步的效果"| Context
     end
-    C->>N: finish_operation
+
+    Done --> Auto{"开启了完全自动模式？"}
+    Auto -->|"是（倒计时结束后拍新图）"| Context
+    Auto -->|"否"| End(["等待你的下一条指令"])
 ```
 
 ### 内置动作原语

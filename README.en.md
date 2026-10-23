@@ -70,33 +70,32 @@ Automation is only useful when you can let go—and stop at any moment:
 
 ## Control Loop at a Glance
 
-```mermaid
-sequenceDiagram
-    participant U as User
-    participant C as React Controller
-    participant N as Rust / Tauri Native
-    participant M as Vision Model API
-    participant D as Windows Desktop
+In plain terms: **take one action, wait for the screen to settle, snap a fresh photo to verify what actually happened, and only then decide the next move.**
 
-    U->>C: Select region · Capture · Send task
-    C->>N: begin_operation
-    loop Until final reply / end_round / cancel / 3 consecutive failures
-        C->>C: Project recent cycles · Retain 1 CURRENT_FRAME
-        C->>N: request_chat_completion
-        N->>M: POST /chat/completions
-        M-->>C: Strategy analysis & tool call
-        C->>C: Adapt protocol · Validate args · Take first call only
-        opt Mouse or keyboard action
-            C->>N: execute_input_action(region, frameId, action)
-            N->>D: Verify focus & coordinates · Dispatch native input
-        end
-        opt Observe next frame
-            C->>N: observe_region
-            N->>D: Sample with app excluded · Capture on settle or deadline
-            N-->>C: Fresh PNG data URL & frameId
-        end
+```mermaid
+flowchart TD
+    Start(["1. Get Ready<br/>Select screen region · Take first screenshot · Send goal"]) --> Context
+
+    subgraph Loop ["Core Control Loop (Press F8 or Stop anytime to interrupt)"]
+        direction TB
+        Context["2. Pack Context for the Model<br/>Keep active goal & recent notes · Attach ONLY the 1 latest screenshot"] --> Think
+        Think{"3. Model Looks & Decides<br/>What is the next step?"}
+
+        Think -->|"Needs mouse or keyboard"| Act["4a. Execute One Action<br/>Click / Drag / Hover / Type / Press Key<br/>(Verifies target window is still focused)"]
+        Think -->|"Screen is loading or animating"| Wait["4b. Wait Quietly<br/>Send no input; let the animation finish"]
+        Think -->|"Goal met / Needs human input"| Done(["5. Finish Current Round<br/>Report summary to user"])
+
+        Act --> CheckFail{"Failed 3 times in a row?"}
+        CheckFail -->|"Yes (Prevent infinite loop)"| Stop(["Auto Circuit Break<br/>Stop & notify user"])
+        CheckFail -->|"No"| Observe
+
+        Wait --> Observe["4c. Wait for Stability & Snap New Photo<br/>See through app window · Capture as soon as screen settles"]
+        Observe -->|"Feed fresh photo back to verify result"| Context
     end
-    C->>N: finish_operation
+
+    Done --> Auto{"Full Auto Mode enabled?"}
+    Auto -->|"Yes (Capture again after delay)"| Context
+    Auto -->|"No"| End(["Stand by for your next instruction"])
 ```
 
 ### Built-in Action Primitives
