@@ -47,4 +47,6 @@ or changing a repository to private does not revoke an exposed credential.
 Fixes are targeted at the current development branch. Historical tags do not
 have a guaranteed backport schedule. Public packages must never contain
 `user-data`, WebView profiles, logs, or exports from a real account.
-See [the publishing checklist](docs/publishing.md).
+`npm run package:public` refuses settings, history, and `user-data`. A personal
+migration archive built with `-IncludeSettings` or `-IncludeHistory` can contain
+API keys, prompts, chat history, and screenshots; never upload one.

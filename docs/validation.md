@@ -22,7 +22,9 @@ The two Rust manifests are independent; testing the Tauri crate alone does
 not run the dependency crate's unit tests.
 
 The opt-in capture exclusion test briefly shows native test windows on an
-interactive Windows desktop. It verifies visible-window exclusion, immunity to
+interactive Windows desktop. These interactive tests live in
+`desktop-core/src/desktop_tests.rs`, apart from the unit tests in `lib.rs`.
+It verifies visible-window exclusion, immunity to
 overlay movement, detection of changes underneath, and display-affinity cleanup.
 Use the application's locked capture dependencies:
 

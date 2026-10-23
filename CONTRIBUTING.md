@@ -67,5 +67,7 @@ Report vulnerabilities using [SECURITY.md](SECURITY.md), not public bug details.
 
 Contributions are under the repository's [MIT license](LICENSE). Retain relevant
 third-party notices; do not submit code or artwork you lack permission to share.
-Releases are a separate maintainer step described in [publishing](docs/publishing.md).
-CI validates code but does not upload installers, publish packages, or deploy.
+Releases are a separate maintainer step: the NSIS installer and the portable
+archive from `npm run package:public` are attached to GitHub Releases, not
+committed. CI validates code but does not upload installers, publish packages,
+or deploy.
