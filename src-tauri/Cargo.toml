@@ -15,7 +15,7 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2.5.3", features = [] }
 
 [dependencies]
-base64 = "0.22"
+base64 = "0.23"
 desktop-automation-core = { path = "../desktop-core" }
 enigo = "0.6.1"
 reqwest = { version = "0.13.4", features = ["json", "rustls", "http2"], default-features = false }
